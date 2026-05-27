@@ -17,12 +17,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install minimal build deps
+      - name: Install build deps
         run: |
-          # catthehacker/ubuntu:act-latest already ships make/curl/git but
-          # xxd + unzip are not always present. Pull just those.
+          # catthehacker/ubuntu:act-latest = Ubuntu 24.04 (noble); ships llvm-18
+          # in the default repos so the apt.llvm.org PPA + deprecated apt-key
+          # dance is unneeded. prospero-clang looks for llvm-config-XX or
+          # llvm-config on PATH and execs that.
           apt-get update -qq
-          apt-get install -y --no-install-recommends xxd unzip ca-certificates
+          apt-get install -y --no-install-recommends \
+              xxd unzip ca-certificates \
+              llvm clang lld
 
       - name: Download PS5 Payload SDK
         run: |
@@ -48,7 +52,6 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           API="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
 
-          # Re-use existing release for this tag if present, else create one.
           REL_ID=$(curl -fsS -H "Authorization: token $TOKEN" \
               "$API/releases/tags/$TAG" 2>/dev/null \
               | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get(\"id\",\"\"))" 2>/dev/null \
@@ -61,7 +64,6 @@ jobs:
                   | python3 -c "import json,sys;print(json.load(sys.stdin)[\"id\"])")
           fi
 
-          # Upload the elf (overwrite if asset of same name already exists).
           EXISTING=$(curl -fsS -H "Authorization: token $TOKEN" \
               "$API/releases/$REL_ID/assets" \
               | python3 -c "import json,sys;[print(a[\"id\"]) for a in json.load(sys.stdin) if a[\"name\"]==\"garlic-savemgr.elf\"]")
