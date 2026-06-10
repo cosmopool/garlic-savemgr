@@ -11,14 +11,18 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/select.h>
 #include <dlfcn.h>
 #include <pthread.h>
 
@@ -44,6 +48,8 @@ int sceFsUfsAllocateSaveData(int fd, uint64_t size, uint64_t flags, int ext);
 
 int sceUserServiceInitialize(void*);
 int sceUserServiceGetForegroundUser(int *user_id);
+int sceSystemServiceGetAppIdOfRunningBigApp(void);
+void sceLncUtilGetAppTitleId(unsigned int app_id, char *title_id);
 
 /* Registry manager — for reading account ID */
 int sceRegMgrGetBin(int, void*, size_t);
@@ -57,17 +63,25 @@ typedef struct { uint8_t id[16]; } SceKernelOpenPsId;
 int sceKernelGetOpenPsId(SceKernelOpenPsId *id);
 int sceKernelGetOpenPsIdForSystem(SceKernelOpenPsId *id);
 
+int sceNetInit(void);
+int sceNetPoolCreate(const char *name, int size, int flags);
+
 /* ── Constants ──────────────────────────────────────────────────── */
 #define PORT            8082
 #define MOUNT_BASE      "/data/save_mnt"
 #define BUF_SIZE        (512 * 1024)
 #define MAX_REQ         8192
 #define MAX_PATH_LEN    1024
+#define CLOUD_CONFIG_PATH "/data/garlic/cloud.json"
+#define CLOUD_QUEUE_DIR "/data/garlic/cloud_queue"
+#define CLOUD_MAX_TITLES 64
 
 /* Mutex for state-mutating operations (mount/unmount/scan) */
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 /* Separate mutex for log buffer */
 static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
+/* Separate mutex for cloud job/status state */
+static pthread_mutex_t g_cloud_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* Ring log buffer for remote debug */
 #define LOG_BUF_SIZE (32 * 1024)
@@ -223,6 +237,883 @@ static void notify(const char *fmt, ...) {
     va_end(a);
     sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
     printf("[GarlicMgr] %s\n", req.message);
+}
+
+/* ── Cloud backup config/status ────────────────────────────────── */
+typedef struct {
+    char host[256];
+    int port;
+    char user[128];
+    char pass[128];
+    char remote_path[512];
+    int use_tls;
+} cloud_ftp_config_t;
+
+typedef struct {
+    char type[32];
+    char project_id[128];
+    char private_key_id[128];
+    char private_key[4096];
+    char client_email[256];
+    char client_id[256];
+    char auth_uri[256];
+    char token_uri[256];
+    char auth_provider_x509_cert_url[256];
+    char client_x509_cert_url[512];
+    char universe_domain[128];
+} cloud_service_account_t;
+
+typedef struct {
+    char mode[32];
+    char auth_mode[32];
+    char folder_id[256];
+    char client_id[256];
+    char client_secret[256];
+    char refresh_token[512];
+    char access_token[2048];
+    cloud_service_account_t service_account;
+} cloud_drive_config_t;
+
+typedef struct {
+    int enabled;
+    int poll_seconds;
+    int settle_seconds;
+    int queue_for_browser_drive;
+} cloud_auto_config_t;
+
+typedef struct {
+    int enabled;
+    char provider[32];
+    char watch_titles[CLOUD_MAX_TITLES][32];
+    int watch_title_count;
+    cloud_ftp_config_t ftp;
+    cloud_drive_config_t drive;
+    cloud_auto_config_t auto_backup;
+} cloud_config_t;
+
+typedef struct {
+    int running;
+    int last_ok;
+    int progress;
+    char active[128];
+    char last_error[256];
+    char last_remote[512];
+} cloud_state_t;
+
+static cloud_state_t g_cloud_state = {0};
+static int g_net_ready = 0;
+
+static const char *json_skip_ws(const char *p) {
+    while (p && *p && isspace((unsigned char)*p)) p++;
+    return p;
+}
+
+static const char *json_find_key(const char *json, const char *key) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    p = json_skip_ws(p);
+    if (!p || *p != ':') return NULL;
+    return json_skip_ws(p + 1);
+}
+
+static int json_parse_string(const char *p, char *out, size_t out_sz) {
+    if (!p || *p != '"' || out_sz == 0) return -1;
+    p++;
+    size_t n = 0;
+    while (*p && *p != '"') {
+        char c = *p++;
+        if (c == '\\' && *p) {
+            c = *p++;
+            if (c == 'n') c = '\n';
+            else if (c == 'r') c = '\r';
+            else if (c == 't') c = '\t';
+        }
+        if (n + 1 < out_sz) out[n++] = c;
+    }
+    out[n] = 0;
+    return *p == '"' ? 0 : -1;
+}
+
+static int json_get_string(const char *json, const char *key, char *out, size_t out_sz) {
+    const char *p = json_find_key(json, key);
+    return json_parse_string(p, out, out_sz);
+}
+
+static int json_get_bool_default(const char *json, const char *key, int def) {
+    const char *p = json_find_key(json, key);
+    if (!p) return def;
+    if (strncmp(p, "true", 4) == 0) return 1;
+    if (strncmp(p, "false", 5) == 0) return 0;
+    return def;
+}
+
+static int json_get_int_default(const char *json, const char *key, int def) {
+    const char *p = json_find_key(json, key);
+    if (!p) return def;
+    return (int)strtol(p, NULL, 10);
+}
+
+static int json_get_object_string(const char *json, const char *obj, const char *key,
+                                  char *out, size_t out_sz) {
+    const char *p = json_find_key(json, obj);
+    if (!p || *p != '{') return -1;
+    return json_get_string(p, key, out, out_sz);
+}
+
+static int json_get_object_bool_default(const char *json, const char *obj,
+                                        const char *key, int def) {
+    const char *p = json_find_key(json, obj);
+    if (!p || *p != '{') return def;
+    return json_get_bool_default(p, key, def);
+}
+
+static int json_get_object_int_default(const char *json, const char *obj,
+                                       const char *key, int def) {
+    const char *p = json_find_key(json, obj);
+    if (!p || *p != '{') return def;
+    return json_get_int_default(p, key, def);
+}
+
+static void cloud_read_ftp_fields(const char *json, cloud_ftp_config_t *ftp) {
+    if (json_get_object_string(json, "ftp", "host", ftp->host, sizeof(ftp->host)) != 0)
+        json_get_string(json, "host", ftp->host, sizeof(ftp->host));
+    ftp->port = json_get_object_int_default(json, "ftp", "port",
+                                            json_get_int_default(json, "port", ftp->port));
+    if (json_get_object_string(json, "ftp", "user", ftp->user, sizeof(ftp->user)) != 0)
+        json_get_string(json, "user", ftp->user, sizeof(ftp->user));
+    if (json_get_object_string(json, "ftp", "pass", ftp->pass, sizeof(ftp->pass)) != 0)
+        json_get_string(json, "pass", ftp->pass, sizeof(ftp->pass));
+    if (json_get_object_string(json, "ftp", "remote_path", ftp->remote_path, sizeof(ftp->remote_path)) != 0)
+        json_get_string(json, "remote_path", ftp->remote_path, sizeof(ftp->remote_path));
+    ftp->use_tls = json_get_object_bool_default(json, "ftp", "use_tls",
+                                                json_get_bool_default(json, "use_tls", ftp->use_tls));
+}
+
+static void cloud_read_drive_fields(const char *json, cloud_drive_config_t *drive) {
+    if (json_get_object_string(json, "google_drive", "mode", drive->mode, sizeof(drive->mode)) != 0)
+        json_get_string(json, "mode", drive->mode, sizeof(drive->mode));
+    if (json_get_object_string(json, "google_drive", "auth_mode", drive->auth_mode, sizeof(drive->auth_mode)) != 0)
+        json_get_string(json, "auth_mode", drive->auth_mode, sizeof(drive->auth_mode));
+    if (json_get_object_string(json, "google_drive", "folder_id", drive->folder_id, sizeof(drive->folder_id)) != 0)
+        json_get_string(json, "folder_id", drive->folder_id, sizeof(drive->folder_id));
+    if (json_get_object_string(json, "google_drive", "client_id", drive->client_id, sizeof(drive->client_id)) != 0)
+        json_get_string(json, "client_id", drive->client_id, sizeof(drive->client_id));
+    if (json_get_object_string(json, "google_drive", "client_secret", drive->client_secret, sizeof(drive->client_secret)) != 0)
+        json_get_string(json, "client_secret", drive->client_secret, sizeof(drive->client_secret));
+    if (json_get_object_string(json, "google_drive", "refresh_token", drive->refresh_token, sizeof(drive->refresh_token)) != 0)
+        json_get_string(json, "refresh_token", drive->refresh_token, sizeof(drive->refresh_token));
+    if (json_get_object_string(json, "google_drive", "access_token", drive->access_token, sizeof(drive->access_token)) != 0)
+        json_get_string(json, "access_token", drive->access_token, sizeof(drive->access_token));
+}
+
+static int json_get_watch_titles(const char *json, cloud_config_t *cfg) {
+    const char *p = json_find_key(json, "watch_titles");
+    if (!p || *p != '[') return 0;
+    p++;
+    while (*p && *p != ']' && cfg->watch_title_count < CLOUD_MAX_TITLES) {
+        p = json_skip_ws(p);
+        if (*p == '"') {
+            if (json_parse_string(p, cfg->watch_titles[cfg->watch_title_count],
+                                  sizeof(cfg->watch_titles[0])) == 0) {
+                cfg->watch_title_count++;
+            }
+            p++;
+            while (*p && *p != '"') {
+                if (*p == '\\' && p[1]) p++;
+                p++;
+            }
+            if (*p == '"') p++;
+        }
+        while (*p && *p != ',' && *p != ']') p++;
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
+static int is_redacted_secret(const char *s) {
+    if (!s || !s[0]) return 1;
+    return strcmp(s, "********") == 0 || strcmp(s, "__KEEP__") == 0;
+}
+
+static void json_escape(const char *in, char *out, size_t out_sz) {
+    size_t n = 0;
+    if (!out_sz) return;
+    for (const unsigned char *p = (const unsigned char *)in; p && *p && n + 1 < out_sz; p++) {
+        if ((*p == '"' || *p == '\\') && n + 2 < out_sz) {
+            out[n++] = '\\';
+            out[n++] = (char)*p;
+        } else if (*p == '\n' && n + 2 < out_sz) {
+            out[n++] = '\\';
+            out[n++] = 'n';
+        } else if (*p == '\r' && n + 2 < out_sz) {
+            out[n++] = '\\';
+            out[n++] = 'r';
+        } else if (*p == '\t' && n + 2 < out_sz) {
+            out[n++] = '\\';
+            out[n++] = 't';
+        } else if (*p >= 0x20) {
+            out[n++] = (char)*p;
+        }
+    }
+    out[n] = 0;
+}
+
+static int read_file_limited(const char *path, char **out, size_t max_len) {
+    *out = NULL;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size <= 0 || (size_t)st.st_size > max_len) {
+        close(fd);
+        return -2;
+    }
+    char *buf = malloc((size_t)st.st_size + 1);
+    if (!buf) { close(fd); return -3; }
+    size_t got = 0;
+    while (got < (size_t)st.st_size) {
+        ssize_t r = read(fd, buf + got, (size_t)st.st_size - got);
+        if (r <= 0) break;
+        got += r;
+    }
+    close(fd);
+    buf[got] = 0;
+    *out = buf;
+    return got == (size_t)st.st_size ? 0 : -4;
+}
+
+static int cloud_load_config(cloud_config_t *cfg, char *err, size_t err_sz) {
+    memset(cfg, 0, sizeof(*cfg));
+    snprintf(cfg->provider, sizeof(cfg->provider), "ftp");
+    cfg->ftp.port = 21;
+    snprintf(cfg->ftp.remote_path, sizeof(cfg->ftp.remote_path), "/");
+    snprintf(cfg->drive.mode, sizeof(cfg->drive.mode), "browser");
+    snprintf(cfg->drive.service_account.type, sizeof(cfg->drive.service_account.type), "service_account");
+    snprintf(cfg->drive.service_account.token_uri, sizeof(cfg->drive.service_account.token_uri), "https://oauth2.googleapis.com/token");
+    snprintf(cfg->drive.service_account.universe_domain, sizeof(cfg->drive.service_account.universe_domain), "googleapis.com");
+    cfg->auto_backup.poll_seconds = 5;
+    cfg->auto_backup.settle_seconds = 15;
+    cfg->auto_backup.queue_for_browser_drive = 1;
+
+    char *json = NULL;
+    int rr = read_file_limited(CLOUD_CONFIG_PATH, &json, 64 * 1024);
+    if (rr < 0) {
+        snprintf(err, err_sz, "Cannot read %s", CLOUD_CONFIG_PATH);
+        return -1;
+    }
+
+    cfg->enabled = json_get_bool_default(json, "enabled", 0);
+    json_get_string(json, "provider", cfg->provider, sizeof(cfg->provider));
+    json_get_watch_titles(json, cfg);
+    cloud_read_ftp_fields(json, &cfg->ftp);
+    cloud_read_drive_fields(json, &cfg->drive);
+    json_get_object_string(json, "service_account", "type", cfg->drive.service_account.type, sizeof(cfg->drive.service_account.type));
+    json_get_object_string(json, "service_account", "project_id", cfg->drive.service_account.project_id, sizeof(cfg->drive.service_account.project_id));
+    json_get_object_string(json, "service_account", "private_key_id", cfg->drive.service_account.private_key_id, sizeof(cfg->drive.service_account.private_key_id));
+    json_get_object_string(json, "service_account", "private_key", cfg->drive.service_account.private_key, sizeof(cfg->drive.service_account.private_key));
+    json_get_object_string(json, "service_account", "client_email", cfg->drive.service_account.client_email, sizeof(cfg->drive.service_account.client_email));
+    json_get_object_string(json, "service_account", "client_id", cfg->drive.service_account.client_id, sizeof(cfg->drive.service_account.client_id));
+    json_get_object_string(json, "service_account", "auth_uri", cfg->drive.service_account.auth_uri, sizeof(cfg->drive.service_account.auth_uri));
+    json_get_object_string(json, "service_account", "token_uri", cfg->drive.service_account.token_uri, sizeof(cfg->drive.service_account.token_uri));
+    json_get_object_string(json, "service_account", "auth_provider_x509_cert_url", cfg->drive.service_account.auth_provider_x509_cert_url, sizeof(cfg->drive.service_account.auth_provider_x509_cert_url));
+    json_get_object_string(json, "service_account", "client_x509_cert_url", cfg->drive.service_account.client_x509_cert_url, sizeof(cfg->drive.service_account.client_x509_cert_url));
+    json_get_object_string(json, "service_account", "universe_domain", cfg->drive.service_account.universe_domain, sizeof(cfg->drive.service_account.universe_domain));
+    cfg->auto_backup.enabled = json_get_object_bool_default(json, "auto_backup", "enabled",
+        json_get_bool_default(json, "auto_enabled", 0));
+    cfg->auto_backup.poll_seconds = json_get_object_int_default(json, "auto_backup", "poll_seconds",
+        json_get_int_default(json, "poll_seconds", cfg->auto_backup.poll_seconds));
+    cfg->auto_backup.settle_seconds = json_get_object_int_default(json, "auto_backup", "settle_seconds",
+        json_get_int_default(json, "settle_seconds", cfg->auto_backup.settle_seconds));
+    cfg->auto_backup.queue_for_browser_drive = json_get_object_bool_default(json, "auto_backup", "queue_for_browser_drive",
+        json_get_bool_default(json, "queue_for_browser_drive", cfg->auto_backup.queue_for_browser_drive));
+    free(json);
+
+    if (!cfg->enabled) return 0;
+    if (strcmp(cfg->provider, "google_drive") != 0)
+        snprintf(cfg->provider, sizeof(cfg->provider), "ftp");
+    if (strcmp(cfg->provider, "ftp") == 0) {
+        if (cfg->ftp.use_tls) {
+            snprintf(err, err_sz, "FTP TLS is not supported in Phase 1");
+            return -2;
+        }
+        if (!cfg->ftp.host[0] || !cfg->ftp.user[0] || !cfg->ftp.pass[0]) {
+            snprintf(err, err_sz, "FTP host/user/pass are required");
+            return -3;
+        }
+        if (cfg->ftp.port <= 0 || cfg->ftp.port > 65535) {
+            snprintf(err, err_sz, "Invalid FTP port");
+            return -4;
+        }
+    } else {
+        if (strcmp(cfg->drive.mode, "direct") != 0)
+            snprintf(cfg->drive.mode, sizeof(cfg->drive.mode), "browser");
+    }
+    if (!cfg->ftp.remote_path[0])
+        snprintf(cfg->ftp.remote_path, sizeof(cfg->ftp.remote_path), "/");
+    if (cfg->auto_backup.poll_seconds < 2) cfg->auto_backup.poll_seconds = 2;
+    if (cfg->auto_backup.settle_seconds < 3) cfg->auto_backup.settle_seconds = 3;
+    return 0;
+}
+
+static int cloud_title_is_watched(const cloud_config_t *cfg, const char *title_id) {
+    if (cfg->watch_title_count == 0) return 1;
+    for (int i = 0; i < cfg->watch_title_count; i++)
+        if (strcmp(cfg->watch_titles[i], title_id) == 0) return 1;
+    return 0;
+}
+
+static int cloud_config_to_json(const cloud_config_t *cfg, char *out, size_t out_sz, int redact) {
+    char provider[64], ftp_host[512], ftp_user[256], ftp_pass[256], ftp_path[1024];
+    char drive_mode[64], auth_mode[64], folder_id[512], client_id[512], client_secret[512], refresh_token[1024], access_token[4096];
+    char sa_type[80], sa_project[256], sa_key_id[256], sa_key[8192], sa_email[512], sa_client_id[512];
+    char sa_auth_uri[512], sa_token_uri[512], sa_auth_cert[512], sa_client_cert[1024], sa_universe[256];
+    json_escape(cfg->provider, provider, sizeof(provider));
+    json_escape(cfg->ftp.host, ftp_host, sizeof(ftp_host));
+    json_escape(cfg->ftp.user, ftp_user, sizeof(ftp_user));
+    json_escape(redact && cfg->ftp.pass[0] ? "********" : cfg->ftp.pass, ftp_pass, sizeof(ftp_pass));
+    json_escape(cfg->ftp.remote_path, ftp_path, sizeof(ftp_path));
+    json_escape(cfg->drive.mode, drive_mode, sizeof(drive_mode));
+    json_escape(cfg->drive.auth_mode, auth_mode, sizeof(auth_mode));
+    json_escape(cfg->drive.folder_id, folder_id, sizeof(folder_id));
+    json_escape(cfg->drive.client_id, client_id, sizeof(client_id));
+    json_escape(redact && cfg->drive.client_secret[0] ? "********" : cfg->drive.client_secret,
+                client_secret, sizeof(client_secret));
+    json_escape(redact && cfg->drive.refresh_token[0] ? "********" : cfg->drive.refresh_token,
+                refresh_token, sizeof(refresh_token));
+    json_escape(redact && cfg->drive.access_token[0] ? "********" : cfg->drive.access_token,
+                access_token, sizeof(access_token));
+    json_escape(cfg->drive.service_account.type, sa_type, sizeof(sa_type));
+    json_escape(cfg->drive.service_account.project_id, sa_project, sizeof(sa_project));
+    json_escape(cfg->drive.service_account.private_key_id, sa_key_id, sizeof(sa_key_id));
+    json_escape(redact && cfg->drive.service_account.private_key[0] ? "********" : cfg->drive.service_account.private_key,
+                sa_key, sizeof(sa_key));
+    json_escape(cfg->drive.service_account.client_email, sa_email, sizeof(sa_email));
+    json_escape(cfg->drive.service_account.client_id, sa_client_id, sizeof(sa_client_id));
+    json_escape(cfg->drive.service_account.auth_uri, sa_auth_uri, sizeof(sa_auth_uri));
+    json_escape(cfg->drive.service_account.token_uri, sa_token_uri, sizeof(sa_token_uri));
+    json_escape(cfg->drive.service_account.auth_provider_x509_cert_url, sa_auth_cert, sizeof(sa_auth_cert));
+    json_escape(cfg->drive.service_account.client_x509_cert_url, sa_client_cert, sizeof(sa_client_cert));
+    json_escape(cfg->drive.service_account.universe_domain, sa_universe, sizeof(sa_universe));
+
+    int pos = snprintf(out, out_sz,
+        "{\n"
+        "  \"enabled\": %s,\n"
+        "  \"provider\": \"%s\",\n"
+        "  \"watch_titles\": [",
+        cfg->enabled ? "true" : "false", provider);
+    for (int i = 0; i < cfg->watch_title_count && pos > 0 && pos < (int)out_sz; i++) {
+        char tid[80];
+        json_escape(cfg->watch_titles[i], tid, sizeof(tid));
+        pos += snprintf(out + pos, out_sz - pos, "%s\"%s\"", i ? ", " : "", tid);
+    }
+    if (pos < 0 || pos >= (int)out_sz) return -1;
+    pos += snprintf(out + pos, out_sz - pos,
+        "],\n"
+        "  \"ftp\": {\n"
+        "    \"host\": \"%s\",\n"
+        "    \"port\": %d,\n"
+        "    \"user\": \"%s\",\n"
+        "    \"pass\": \"%s\",\n"
+        "    \"remote_path\": \"%s\",\n"
+        "    \"use_tls\": %s\n"
+        "  },\n"
+        "  \"auto_backup\": {\n"
+        "    \"enabled\": %s,\n"
+        "    \"auto_enabled\": %s,\n"
+        "    \"poll_seconds\": %d,\n"
+        "    \"settle_seconds\": %d,\n"
+        "    \"queue_for_browser_drive\": %s\n"
+        "  },\n"
+        "  \"google_drive\": {\n"
+        "    \"mode\": \"%s\",\n"
+        "    \"auth_mode\": \"%s\",\n"
+        "    \"folder_id\": \"%s\",\n"
+        "    \"client_id\": \"%s\",\n"
+        "    \"client_secret\": \"%s\",\n"
+        "    \"refresh_token\": \"%s\",\n"
+        "    \"access_token\": \"%s\",\n"
+        "    \"service_account\": {\n"
+        "      \"type\": \"%s\",\n"
+        "      \"project_id\": \"%s\",\n"
+        "      \"private_key_id\": \"%s\",\n"
+        "      \"private_key\": \"%s\",\n"
+        "      \"client_email\": \"%s\",\n"
+        "      \"client_id\": \"%s\",\n"
+        "      \"auth_uri\": \"%s\",\n"
+        "      \"token_uri\": \"%s\",\n"
+        "      \"auth_provider_x509_cert_url\": \"%s\",\n"
+        "      \"client_x509_cert_url\": \"%s\",\n"
+        "      \"universe_domain\": \"%s\"\n"
+        "    }\n"
+        "  }\n"
+        "}\n",
+        ftp_host, cfg->ftp.port, ftp_user, ftp_pass, ftp_path,
+        cfg->ftp.use_tls ? "true" : "false",
+        cfg->auto_backup.enabled ? "true" : "false",
+        cfg->auto_backup.enabled ? "true" : "false",
+        cfg->auto_backup.poll_seconds,
+        cfg->auto_backup.settle_seconds,
+        cfg->auto_backup.queue_for_browser_drive ? "true" : "false",
+        drive_mode, auth_mode, folder_id, client_id, client_secret, refresh_token, access_token,
+        sa_type, sa_project, sa_key_id, sa_key, sa_email, sa_client_id,
+        sa_auth_uri, sa_token_uri, sa_auth_cert, sa_client_cert, sa_universe);
+    return (pos > 0 && pos < (int)out_sz) ? 0 : -1;
+}
+
+static void cloud_merge_secrets(cloud_config_t *dst, const cloud_config_t *old_cfg) {
+    if (old_cfg) {
+        if (is_redacted_secret(dst->ftp.pass))
+            snprintf(dst->ftp.pass, sizeof(dst->ftp.pass), "%s", old_cfg->ftp.pass);
+        if (is_redacted_secret(dst->drive.client_secret))
+            snprintf(dst->drive.client_secret, sizeof(dst->drive.client_secret), "%s", old_cfg->drive.client_secret);
+        if (is_redacted_secret(dst->drive.refresh_token))
+            snprintf(dst->drive.refresh_token, sizeof(dst->drive.refresh_token), "%s", old_cfg->drive.refresh_token);
+        if (is_redacted_secret(dst->drive.access_token))
+            snprintf(dst->drive.access_token, sizeof(dst->drive.access_token), "%s", old_cfg->drive.access_token);
+        if (is_redacted_secret(dst->drive.service_account.private_key))
+            snprintf(dst->drive.service_account.private_key, sizeof(dst->drive.service_account.private_key), "%s", old_cfg->drive.service_account.private_key);
+    }
+}
+
+static int cloud_parse_config_text(const char *json, cloud_config_t *cfg, char *err, size_t err_sz) {
+    memset(cfg, 0, sizeof(*cfg));
+    snprintf(cfg->provider, sizeof(cfg->provider), "ftp");
+    snprintf(cfg->drive.mode, sizeof(cfg->drive.mode), "browser");
+    snprintf(cfg->drive.service_account.type, sizeof(cfg->drive.service_account.type), "service_account");
+    snprintf(cfg->drive.service_account.token_uri, sizeof(cfg->drive.service_account.token_uri), "https://oauth2.googleapis.com/token");
+    snprintf(cfg->drive.service_account.universe_domain, sizeof(cfg->drive.service_account.universe_domain), "googleapis.com");
+    cfg->ftp.port = 21;
+    snprintf(cfg->ftp.remote_path, sizeof(cfg->ftp.remote_path), "/");
+    cfg->auto_backup.poll_seconds = 5;
+    cfg->auto_backup.settle_seconds = 15;
+    cfg->auto_backup.queue_for_browser_drive = 1;
+
+    cfg->enabled = json_get_bool_default(json, "enabled", 0);
+    json_get_string(json, "provider", cfg->provider, sizeof(cfg->provider));
+    json_get_watch_titles(json, cfg);
+    cloud_read_ftp_fields(json, &cfg->ftp);
+    cloud_read_drive_fields(json, &cfg->drive);
+    json_get_object_string(json, "service_account", "type", cfg->drive.service_account.type, sizeof(cfg->drive.service_account.type));
+    json_get_object_string(json, "service_account", "project_id", cfg->drive.service_account.project_id, sizeof(cfg->drive.service_account.project_id));
+    json_get_object_string(json, "service_account", "private_key_id", cfg->drive.service_account.private_key_id, sizeof(cfg->drive.service_account.private_key_id));
+    json_get_object_string(json, "service_account", "private_key", cfg->drive.service_account.private_key, sizeof(cfg->drive.service_account.private_key));
+    json_get_object_string(json, "service_account", "client_email", cfg->drive.service_account.client_email, sizeof(cfg->drive.service_account.client_email));
+    json_get_object_string(json, "service_account", "client_id", cfg->drive.service_account.client_id, sizeof(cfg->drive.service_account.client_id));
+    json_get_object_string(json, "service_account", "auth_uri", cfg->drive.service_account.auth_uri, sizeof(cfg->drive.service_account.auth_uri));
+    json_get_object_string(json, "service_account", "token_uri", cfg->drive.service_account.token_uri, sizeof(cfg->drive.service_account.token_uri));
+    json_get_object_string(json, "service_account", "auth_provider_x509_cert_url", cfg->drive.service_account.auth_provider_x509_cert_url, sizeof(cfg->drive.service_account.auth_provider_x509_cert_url));
+    json_get_object_string(json, "service_account", "client_x509_cert_url", cfg->drive.service_account.client_x509_cert_url, sizeof(cfg->drive.service_account.client_x509_cert_url));
+    json_get_object_string(json, "service_account", "universe_domain", cfg->drive.service_account.universe_domain, sizeof(cfg->drive.service_account.universe_domain));
+    cfg->auto_backup.enabled = json_get_object_bool_default(json, "auto_backup", "enabled",
+        json_get_bool_default(json, "auto_enabled", 0));
+    cfg->auto_backup.poll_seconds = json_get_object_int_default(json, "auto_backup", "poll_seconds",
+        json_get_int_default(json, "poll_seconds", cfg->auto_backup.poll_seconds));
+    cfg->auto_backup.settle_seconds = json_get_object_int_default(json, "auto_backup", "settle_seconds",
+        json_get_int_default(json, "settle_seconds", cfg->auto_backup.settle_seconds));
+    cfg->auto_backup.queue_for_browser_drive = json_get_object_bool_default(json, "auto_backup", "queue_for_browser_drive",
+        json_get_bool_default(json, "queue_for_browser_drive", cfg->auto_backup.queue_for_browser_drive));
+
+    if (strcmp(cfg->provider, "google_drive") != 0)
+        snprintf(cfg->provider, sizeof(cfg->provider), "ftp");
+    if (strcmp(cfg->drive.mode, "direct") != 0)
+        snprintf(cfg->drive.mode, sizeof(cfg->drive.mode), "browser");
+    if (cfg->ftp.port <= 0 || cfg->ftp.port > 65535) {
+        snprintf(err, err_sz, "Invalid FTP port");
+        return -1;
+    }
+    if (!cfg->ftp.remote_path[0])
+        snprintf(cfg->ftp.remote_path, sizeof(cfg->ftp.remote_path), "/");
+    if (cfg->auto_backup.poll_seconds < 2) cfg->auto_backup.poll_seconds = 2;
+    if (cfg->auto_backup.settle_seconds < 3) cfg->auto_backup.settle_seconds = 3;
+    return 0;
+}
+
+static int cloud_save_config(const cloud_config_t *cfg, char *err, size_t err_sz) {
+    mkdir("/data", 0777);
+    mkdir("/data/garlic", 0777);
+    char json[32768];
+    if (cloud_config_to_json(cfg, json, sizeof(json), 0) < 0) {
+        snprintf(err, err_sz, "Config is too large");
+        return -1;
+    }
+    int fd = open(CLOUD_CONFIG_PATH, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd < 0) {
+        snprintf(err, err_sz, "Cannot write %s", CLOUD_CONFIG_PATH);
+        return -1;
+    }
+    size_t len = strlen(json), off = 0;
+    while (off < len) {
+        ssize_t wr = write(fd, json + off, len - off);
+        if (wr <= 0) { close(fd); snprintf(err, err_sz, "Config write failed"); return -1; }
+        off += wr;
+    }
+    close(fd);
+    return 0;
+}
+
+static void cloud_set_running(const char *active) {
+    pthread_mutex_lock(&g_cloud_mtx);
+    g_cloud_state.running = 1;
+    g_cloud_state.progress = 0;
+    g_cloud_state.last_ok = 0;
+    g_cloud_state.last_error[0] = 0;
+    snprintf(g_cloud_state.active, sizeof(g_cloud_state.active), "%s", active ? active : "Cloud upload");
+    pthread_mutex_unlock(&g_cloud_mtx);
+}
+
+static void cloud_set_progress(int progress, const char *remote) {
+    pthread_mutex_lock(&g_cloud_mtx);
+    g_cloud_state.progress = progress;
+    if (remote && remote[0])
+        snprintf(g_cloud_state.last_remote, sizeof(g_cloud_state.last_remote), "%s", remote);
+    pthread_mutex_unlock(&g_cloud_mtx);
+}
+
+static void cloud_set_done(int ok, const char *message, const char *remote) {
+    pthread_mutex_lock(&g_cloud_mtx);
+    g_cloud_state.running = 0;
+    g_cloud_state.progress = ok ? 100 : g_cloud_state.progress;
+    g_cloud_state.last_ok = ok;
+    if (ok) {
+        g_cloud_state.last_error[0] = 0;
+    } else {
+        snprintf(g_cloud_state.last_error, sizeof(g_cloud_state.last_error), "%s",
+                 message ? message : "Cloud upload failed");
+    }
+    if (remote && remote[0])
+        snprintf(g_cloud_state.last_remote, sizeof(g_cloud_state.last_remote), "%s", remote);
+    pthread_mutex_unlock(&g_cloud_mtx);
+}
+
+static void url_param_decode(const char *src, char *dst, size_t dst_sz) {
+    size_t n = 0;
+    if (!dst_sz) return;
+    while (src && *src && *src != '&' && n + 1 < dst_sz) {
+        if (*src == '%' && src[1] && src[2]) {
+            char hex[3] = {src[1], src[2], 0};
+            dst[n++] = (char)strtol(hex, NULL, 16);
+            src += 3;
+        } else if (*src == '+') {
+            dst[n++] = ' ';
+            src++;
+        } else {
+            dst[n++] = *src++;
+        }
+    }
+    dst[n] = 0;
+}
+
+static void sanitize_filename(char *s) {
+    for (char *p = s; p && *p; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':' || *p == '*' || *p == '?' ||
+            *p == '"' || *p == '<' || *p == '>' || *p == '|' ||
+            *p == '\r' || *p == '\n') {
+            *p = '_';
+        }
+    }
+}
+
+/* ── Minimal passive FTP client ────────────────────────────────── */
+typedef struct {
+    int ctrl;
+    char last[512];
+    char ctrl_host[64]; /* peer IP of control connection (for PASV NAT fix) */
+} ftp_client_t;
+
+static int send_all_fd(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int net_init_once(void) {
+    if (g_net_ready) return 0;
+    if (sceNetInit() != 0) return -1;
+    if (sceNetPoolCreate("garlic_net", 128 * 1024, 0) < 0) return -2;
+    g_net_ready = 1;
+    return 0;
+}
+
+static int tcp_connect_host(const char *host, int port, char *err, size_t err_sz) {
+    if (!g_net_ready) {
+        int nr = net_init_once();
+        if (nr < 0) {
+            snprintf(err, err_sz, "PS5 network init failed (%d); outbound FTP needs sceNetInit", nr);
+            return -1;
+        }
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        snprintf(err, err_sz, "socket failed: %s", strerror(errno));
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = inet_addr(host);
+    if (addr.sin_addr.s_addr == INADDR_NONE) {
+        struct hostent *he = gethostbyname(host);
+        if (!he || !he->h_addr_list || !he->h_addr_list[0]) {
+            snprintf(err, err_sz, "Cannot resolve FTP host %s", host);
+            close(fd);
+            return -1;
+        }
+        memcpy(&addr.sin_addr, he->h_addr_list[0], sizeof(addr.sin_addr));
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    int cr = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (cr < 0 && errno != EINPROGRESS) {
+        snprintf(err, err_sz, "connect to %s:%d failed: %s", host, port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (cr != 0) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        if (select(fd + 1, NULL, &wfds, NULL, &tv) <= 0) {
+            snprintf(err, err_sz, "connect to %s:%d timed out after 30s", host, port);
+            close(fd);
+            return -1;
+        }
+        int soerr = 0;
+        socklen_t slen = sizeof(soerr);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+        if (soerr != 0) {
+            snprintf(err, err_sz, "connect to %s:%d failed: %s", host, port, strerror(soerr));
+            close(fd);
+            return -1;
+        }
+    }
+    if (flags >= 0) fcntl(fd, F_SETFL, flags);
+    return fd;
+}
+
+static int ftp_read_line(int fd, char *line, size_t line_sz) {
+    size_t n = 0;
+    while (n + 1 < line_sz) {
+        char c;
+        ssize_t r = recv(fd, &c, 1, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return -1;
+        line[n++] = c;
+        if (c == '\n') break;
+    }
+    line[n] = 0;
+    return (int)n;
+}
+
+static int ftp_read_response(ftp_client_t *ftp) {
+    char line[512];
+    int code = -1, multiline = 0;
+    char first_code[4] = {0};
+
+    while (ftp_read_line(ftp->ctrl, line, sizeof(line)) > 0) {
+        snprintf(ftp->last, sizeof(ftp->last), "%s", line);
+        if (isdigit((unsigned char)line[0]) &&
+            isdigit((unsigned char)line[1]) &&
+            isdigit((unsigned char)line[2])) {
+            if (code < 0) {
+                code = atoi(line);
+                memcpy(first_code, line, 3);
+                first_code[3] = 0;
+                multiline = (line[3] == '-');
+                if (!multiline) return code;
+            } else if (multiline && strncmp(line, first_code, 3) == 0 && line[3] == ' ') {
+                return code;
+            }
+        }
+    }
+    return -1;
+}
+
+static int ftp_cmd(ftp_client_t *ftp, const char *cmd, char *err, size_t err_sz) {
+    char line[768];
+    int n = snprintf(line, sizeof(line), "%s\r\n", cmd);
+    if (n <= 0 || n >= (int)sizeof(line) || send_all_fd(ftp->ctrl, line, (size_t)n) < 0) {
+        snprintf(err, err_sz, "FTP command send failed");
+        return -1;
+    }
+    int code = ftp_read_response(ftp);
+    if (code < 0) snprintf(err, err_sz, "FTP response read failed");
+    return code;
+}
+
+static int ftp_connect_login(ftp_client_t *ftp, const cloud_ftp_config_t *cfg,
+                             char *err, size_t err_sz) {
+    memset(ftp, 0, sizeof(*ftp));
+    ftp->ctrl = -1;
+
+    ftp->ctrl = tcp_connect_host(cfg->host, cfg->port, err, err_sz);
+    if (ftp->ctrl < 0) return -1;
+
+    int code = ftp_read_response(ftp);
+    if (code != 220) {
+        snprintf(err, err_sz, "FTP greeting failed: %.120s", ftp->last);
+        close(ftp->ctrl); ftp->ctrl = -1;
+        return -1;
+    }
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "USER %s", cfg->user);
+    code = ftp_cmd(ftp, cmd, err, err_sz);
+    if (code == 331) {
+        snprintf(cmd, sizeof(cmd), "PASS %s", cfg->pass);
+        code = ftp_cmd(ftp, cmd, err, err_sz);
+    }
+    if (code != 230) {
+        snprintf(err, err_sz, "FTP login failed: %.120s", ftp->last);
+        close(ftp->ctrl); ftp->ctrl = -1;
+        return -1;
+    }
+
+    code = ftp_cmd(ftp, "TYPE I", err, err_sz);
+    if (code != 200) {
+        snprintf(err, err_sz, "FTP binary mode failed: %.120s", ftp->last);
+        close(ftp->ctrl); ftp->ctrl = -1;
+        return -1;
+    }
+
+    struct sockaddr_in peer;
+    socklen_t plen = sizeof(peer);
+    if (getpeername(ftp->ctrl, (struct sockaddr *)&peer, &plen) == 0)
+        inet_ntop(AF_INET, &peer.sin_addr, ftp->ctrl_host, sizeof(ftp->ctrl_host));
+    else
+        snprintf(ftp->ctrl_host, sizeof(ftp->ctrl_host), "%s", cfg->host);
+    return 0;
+}
+
+static void ftp_close(ftp_client_t *ftp) {
+    if (ftp->ctrl >= 0) {
+        char err[64];
+        ftp_cmd(ftp, "QUIT", err, sizeof(err));
+        close(ftp->ctrl);
+        ftp->ctrl = -1;
+    }
+}
+
+static void ftp_clean_segment(char *seg) {
+    for (char *p = seg; *p; p++) {
+        if (*p == '\r' || *p == '\n') *p = '_';
+    }
+}
+
+static int ftp_cwd_mkdirs(ftp_client_t *ftp, const char *path, char *err, size_t err_sz) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", path && path[0] ? path : "/");
+
+    if (tmp[0] == '/') {
+        int code = ftp_cmd(ftp, "CWD /", err, err_sz);
+        if (code >= 400) {
+            snprintf(err, err_sz, "FTP CWD / failed: %.120s", ftp->last);
+            return -1;
+        }
+    }
+
+    char *p = tmp;
+    while (*p == '/') p++;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = 0;
+        if (p[0]) {
+            ftp_clean_segment(p);
+            char cmd[600];
+            snprintf(cmd, sizeof(cmd), "CWD %s", p);
+            int code = ftp_cmd(ftp, cmd, err, err_sz);
+            if (code >= 400) {
+                snprintf(cmd, sizeof(cmd), "MKD %s", p);
+                code = ftp_cmd(ftp, cmd, err, err_sz);
+                if (code >= 400 && code != 550) {
+                    snprintf(err, err_sz, "FTP MKD failed: %.120s", ftp->last);
+                    return -1;
+                }
+                snprintf(cmd, sizeof(cmd), "CWD %s", p);
+                code = ftp_cmd(ftp, cmd, err, err_sz);
+                if (code >= 400) {
+                    snprintf(err, err_sz, "FTP CWD failed: %.120s", ftp->last);
+                    return -1;
+                }
+            }
+        }
+        if (!slash) break;
+        p = slash + 1;
+        while (*p == '/') p++;
+    }
+    return 0;
+}
+
+static int ftp_pasv_connect(ftp_client_t *ftp, char *err, size_t err_sz) {
+    int code = ftp_cmd(ftp, "PASV", err, err_sz);
+    if (code != 227) {
+        snprintf(err, err_sz, "FTP PASV failed: %.120s", ftp->last);
+        return -1;
+    }
+
+    int h1, h2, h3, h4, p1, p2;
+    char *lp = strchr(ftp->last, '(');
+    if (!lp || sscanf(lp, "(%d,%d,%d,%d,%d,%d)", &h1, &h2, &h3, &h4, &p1, &p2) != 6) {
+        snprintf(err, err_sz, "Cannot parse FTP PASV response");
+        return -1;
+    }
+    char pasv_host[64];
+    snprintf(pasv_host, sizeof(pasv_host), "%d.%d.%d.%d", h1, h2, h3, h4);
+    int port = p1 * 256 + p2;
+
+    /* Many local FTP servers advertise 127.0.0.1 or a WAN IP in PASV; use the
+     * control peer address for the data connection when they differ. */
+    const char *data_host = pasv_host;
+    if (ftp->ctrl_host[0] &&
+        (strcmp(pasv_host, "127.0.0.1") == 0 ||
+         strcmp(pasv_host, "0.0.0.0") == 0 ||
+         strcmp(pasv_host, ftp->ctrl_host) != 0)) {
+        data_host = ftp->ctrl_host;
+    }
+    return tcp_connect_host(data_host, port, err, err_sz);
+}
+
+static int ftp_begin_stor(ftp_client_t *ftp, const char *remote_name,
+                          char *err, size_t err_sz) {
+    int data = ftp_pasv_connect(ftp, err, err_sz);
+    if (data < 0) return -1;
+
+    char safe_name[256];
+    snprintf(safe_name, sizeof(safe_name), "%s", remote_name);
+    ftp_clean_segment(safe_name);
+
+    char cmd[384];
+    snprintf(cmd, sizeof(cmd), "STOR %s", safe_name);
+    int code = ftp_cmd(ftp, cmd, err, err_sz);
+    if (code != 125 && code != 150) {
+        snprintf(err, err_sz, "FTP STOR failed: %.120s", ftp->last);
+        close(data);
+        return -1;
+    }
+    return data;
+}
+
+static int ftp_finish_stor(ftp_client_t *ftp, int data_sock, char *err, size_t err_sz) {
+    close(data_sock);
+    int code = ftp_read_response(ftp);
+    if (code != 226 && code != 250) {
+        snprintf(err, err_sz, "FTP upload failed: %.120s", ftp->last);
+        return -1;
+    }
+    return 0;
 }
 
 /* ── Save discovery ─────────────────────────────────────────────── */
@@ -1227,9 +2118,50 @@ static void zip_send(int sock, const char *base) {
 /* ── Zip streaming for specific files by path ──────────────────── */
 typedef struct { const char *path; const char *name; } zip_file_t;
 
-static void zip_send_files(int sock, const zip_file_t *files, int nfiles, char *iobuf) {
+typedef int (*zip_write_fn)(void *ctx, const void *buf, size_t len);
+typedef struct {
+    zip_write_fn write;
+    void *ctx;
+    uint64_t bytes;
+} zip_sink_t;
+
+static int socket_zip_write(void *ctx, const void *buf, size_t len) {
+    int sock = *(int *)ctx;
+    return send_all_fd(sock, buf, len);
+}
+
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} mem_buf_t;
+
+static int mem_zip_write(void *ctx, const void *buf, size_t len) {
+    mem_buf_t *m = (mem_buf_t *)ctx;
+    if (m->len + len > m->cap) {
+        size_t newcap = m->cap ? m->cap * 2 : 1024 * 1024;
+        while (newcap < m->len + len) newcap *= 2;
+        uint8_t *p = realloc(m->data, newcap);
+        if (!p) return -1;
+        m->data = p;
+        m->cap = newcap;
+    }
+    memcpy(m->data + m->len, buf, len);
+    m->len += len;
+    return 0;
+}
+
+static int zip_sink_write(zip_sink_t *sink, const void *buf, size_t len) {
+    if (!sink || !sink->write) return -1;
+    if (len == 0) return 0;
+    if (sink->write(sink->ctx, buf, len) < 0) return -1;
+    sink->bytes += len;
+    return 0;
+}
+
+static int zip_write_files(zip_sink_t *sink, const zip_file_t *files, int nfiles, char *iobuf) {
     zip_entry_t *entries = malloc(nfiles * sizeof(zip_entry_t));
-    if (!entries) return;
+    if (!entries) return -1;
 
     uint32_t offset = 0;
     for (int i = 0; i < nfiles; i++) {
@@ -1252,8 +2184,12 @@ static void zip_send_files(int sock, const zip_file_t *files, int nfiles, char *
         lh[4]=20;
         lh[6]=0x08; /* flag: data descriptor follows — CRC+sizes must be 0 */
         memcpy(lh+26, &nlen, 2);
-        send(sock, lh, 30, 0);
-        send(sock, e->name, nlen, 0);
+        if (zip_sink_write(sink, lh, 30) < 0 ||
+            zip_sink_write(sink, e->name, nlen) < 0) {
+            close(fd);
+            free(entries);
+            return -1;
+        }
 
         uint32_t crc = 0xFFFFFFFF;
         char *buf = iobuf;
@@ -1264,7 +2200,11 @@ static void zip_send_files(int sock, const zip_file_t *files, int nfiles, char *
                 for (int k = 0; k < 8; k++)
                     crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
             }
-            send(sock, buf, nr, 0);
+            if (zip_sink_write(sink, buf, (size_t)nr) < 0) {
+                close(fd);
+                free(entries);
+                return -1;
+            }
         }
         close(fd);
         crc ^= 0xFFFFFFFF;
@@ -1276,7 +2216,10 @@ static void zip_send_files(int sock, const zip_file_t *files, int nfiles, char *
         memcpy(dd+4, &e->crc, 4);
         memcpy(dd+8, &e->size, 4);
         memcpy(dd+12, &e->size, 4);
-        send(sock, dd, 16, 0);
+        if (zip_sink_write(sink, dd, 16) < 0) {
+            free(entries);
+            return -1;
+        }
 
         offset += 30 + nlen + e->size + 16;
     }
@@ -1293,8 +2236,11 @@ static void zip_send_files(int sock, const zip_file_t *files, int nfiles, char *
         memcpy(cd+24, &e->size, 4);
         memcpy(cd+28, &nlen, 2);
         memcpy(cd+42, &e->offset, 4);
-        send(sock, cd, 46, 0);
-        send(sock, e->name, nlen, 0);
+        if (zip_sink_write(sink, cd, 46) < 0 ||
+            zip_sink_write(sink, e->name, nlen) < 0) {
+            free(entries);
+            return -1;
+        }
         offset += 46 + nlen;
     }
     uint32_t cd_size = offset - cd_offset;
@@ -1306,8 +2252,681 @@ static void zip_send_files(int sock, const zip_file_t *files, int nfiles, char *
     memcpy(ecd+10, &cnt16, 2);
     memcpy(ecd+12, &cd_size, 4);
     memcpy(ecd+16, &cd_offset, 4);
-    send(sock, ecd, 22, 0);
+    if (zip_sink_write(sink, ecd, 22) < 0) {
+        free(entries);
+        return -1;
+    }
     free(entries);
+    return 0;
+}
+
+static void zip_send_files(int sock, const zip_file_t *files, int nfiles, char *iobuf) {
+    zip_sink_t sink;
+    sink.write = socket_zip_write;
+    sink.ctx = &sock;
+    sink.bytes = 0;
+    zip_write_files(&sink, files, nfiles, iobuf);
+}
+
+typedef struct {
+    int is_title;
+    save_entry_t save;
+    char title_id[32];
+} cloud_job_args_t;
+
+static int cloud_start_job(cloud_job_args_t *job, char *err, size_t err_sz);
+
+static int ftp_data_zip_write(void *ctx, const void *buf, size_t len) {
+    int data_sock = *(int *)ctx;
+    return send_all_fd(data_sock, buf, len);
+}
+
+static void cloud_timestamp(char *out, size_t out_sz) {
+    time_t now = time(NULL);
+    struct tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    localtime_r(&now, &tmv);
+    snprintf(out, out_sz, "%04d%02d%02d-%02d%02d%02d",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+static void cloud_remote_dir(const cloud_config_t *cfg, const char *title_id,
+                             const char *user_id, char *out, size_t out_sz) {
+    const char *uid = (user_id && user_id[0]) ? user_id : "system";
+    char base[512];
+    snprintf(base, sizeof(base), "%s", cfg->ftp.remote_path[0] ? cfg->ftp.remote_path : "/");
+    size_t len = strlen(base);
+    while (len > 1 && base[len - 1] == '/') base[--len] = 0;
+    snprintf(out, out_sz, "%s/%s/%s", base, title_id, uid);
+}
+
+static int cloud_upload_zip_files(const cloud_config_t *cfg, const char *remote_dir,
+                                  const char *remote_name, const zip_file_t *files,
+                                  int nfiles, char *iobuf, char *err, size_t err_sz) {
+    ftp_client_t ftp;
+    if (ftp_connect_login(&ftp, &cfg->ftp, err, err_sz) < 0) return -1;
+    if (ftp_cwd_mkdirs(&ftp, remote_dir, err, err_sz) < 0) {
+        ftp_close(&ftp);
+        return -1;
+    }
+
+    int data_sock = ftp_begin_stor(&ftp, remote_name, err, err_sz);
+    if (data_sock < 0) {
+        ftp_close(&ftp);
+        return -1;
+    }
+
+    zip_sink_t sink;
+    sink.write = ftp_data_zip_write;
+    sink.ctx = &data_sock;
+    sink.bytes = 0;
+    int zr = zip_write_files(&sink, files, nfiles, iobuf);
+    if (zr < 0) {
+        snprintf(err, err_sz, "Failed while streaming ZIP to FTP");
+        close(data_sock);
+        ftp_close(&ftp);
+        return -1;
+    }
+
+    if (ftp_finish_stor(&ftp, data_sock, err, err_sz) < 0) {
+        ftp_close(&ftp);
+        return -1;
+    }
+    ftp_close(&ftp);
+    return 0;
+}
+
+static int cloud_build_single_files(const save_entry_t *s, zip_file_t *files,
+                                    char names[][512], char *bin_path,
+                                    int *nfiles) {
+    *nfiles = 0;
+    struct stat st;
+    if (stat(s->path, &st) < 0 || !S_ISREG(st.st_mode)) return -1;
+
+    snprintf(names[*nfiles], 512, "%s/%s", s->title_id, s->save_name);
+    files[*nfiles].path = s->path;
+    files[*nfiles].name = names[*nfiles];
+    (*nfiles)++;
+
+    if (s->is_ps4 && strncmp(s->save_name, "sdimg_", 6) == 0) {
+        const char *savename = s->save_name + 6;
+        char dir[MAX_PATH_LEN];
+        strncpy(dir, s->path, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = 0;
+        char *sl = strrchr(dir, '/');
+        if (sl) *(sl + 1) = 0;
+        snprintf(bin_path, MAX_PATH_LEN, "%s%s.bin", dir, savename);
+        if (stat(bin_path, &st) == 0 && S_ISREG(st.st_mode)) {
+            snprintf(names[*nfiles], 512, "%s/%s.bin", s->title_id, savename);
+            files[*nfiles].path = bin_path;
+            files[*nfiles].name = names[*nfiles];
+            (*nfiles)++;
+        }
+    }
+    return 0;
+}
+
+static int cloud_collect_title_files(const char *title_id, zip_file_t **out_files,
+                                     char ***out_names, char ***out_allocs,
+                                     int *out_nfiles, int *out_nallocs,
+                                     char *err, size_t err_sz) {
+    *out_files = NULL;
+    *out_names = NULL;
+    *out_allocs = NULL;
+    *out_nfiles = 0;
+    *out_nallocs = 0;
+
+    zip_file_t *zfiles = malloc(g_save_count * 2 * sizeof(zip_file_t));
+    char **names = malloc(g_save_count * 2 * sizeof(char *));
+    char **allocs = malloc(g_save_count * sizeof(char *));
+    if (!zfiles || !names || !allocs) {
+        free(zfiles); free(names); free(allocs);
+        snprintf(err, err_sz, "Out of memory");
+        return -1;
+    }
+
+    int nfiles = 0, nallocs = 0;
+    for (int i = 0; i < g_save_count; i++) {
+        if (strcmp(g_saves[i].title_id, title_id) != 0 || g_saves[i].is_usb) continue;
+        struct stat fst;
+        if (stat(g_saves[i].path, &fst) < 0 || !S_ISREG(fst.st_mode)) continue;
+
+        names[nfiles] = malloc(512);
+        if (!names[nfiles]) continue;
+        snprintf(names[nfiles], 512, "%s/%s", title_id, g_saves[i].save_name);
+        zfiles[nfiles].path = g_saves[i].path;
+        zfiles[nfiles].name = names[nfiles];
+        nfiles++;
+
+        if (g_saves[i].is_ps4 && strncmp(g_saves[i].save_name, "sdimg_", 6) == 0) {
+            const char *savename = g_saves[i].save_name + 6;
+            char dir[MAX_PATH_LEN];
+            strncpy(dir, g_saves[i].path, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = 0;
+            char *sl = strrchr(dir, '/');
+            if (sl) *(sl + 1) = 0;
+            char *bin_path = malloc(MAX_PATH_LEN);
+            if (!bin_path) continue;
+            snprintf(bin_path, MAX_PATH_LEN, "%s%s.bin", dir, savename);
+            if (stat(bin_path, &fst) == 0 && S_ISREG(fst.st_mode)) {
+                names[nfiles] = malloc(512);
+                if (!names[nfiles]) { free(bin_path); continue; }
+                snprintf(names[nfiles], 512, "%s/%s.bin", title_id, savename);
+                zfiles[nfiles].path = bin_path;
+                zfiles[nfiles].name = names[nfiles];
+                allocs[nallocs++] = bin_path;
+                nfiles++;
+            } else {
+                free(bin_path);
+            }
+        }
+    }
+
+    if (nfiles == 0) {
+        free(zfiles); free(names); free(allocs);
+        snprintf(err, err_sz, "No system saves found for this title");
+        return -1;
+    }
+
+    *out_files = zfiles;
+    *out_names = names;
+    *out_allocs = allocs;
+    *out_nfiles = nfiles;
+    *out_nallocs = nallocs;
+    return 0;
+}
+
+static void cloud_free_title_files(char **names, char **allocs, int nfiles, int nallocs,
+                                   zip_file_t *zfiles) {
+    if (names) for (int i = 0; i < nfiles; i++) free(names[i]);
+    if (allocs) for (int i = 0; i < nallocs; i++) free(allocs[i]);
+    free(names);
+    free(allocs);
+    free(zfiles);
+}
+
+static int cloud_zip_files_to_memory(const zip_file_t *files, int nfiles, char *iobuf,
+                                     mem_buf_t *out, char *err, size_t err_sz) {
+    memset(out, 0, sizeof(*out));
+    zip_sink_t sink;
+    sink.write = mem_zip_write;
+    sink.ctx = out;
+    sink.bytes = 0;
+    if (zip_write_files(&sink, files, nfiles, iobuf) < 0) {
+        free(out->data);
+        memset(out, 0, sizeof(*out));
+        snprintf(err, err_sz, "Failed to package backup ZIP");
+        return -1;
+    }
+    return 0;
+}
+
+static int cloud_package_single(int idx, char *iobuf, mem_buf_t *out,
+                                char *filename, size_t filename_sz,
+                                char *err, size_t err_sz) {
+    scan_saves();
+    if (idx < 0 || idx >= g_save_count || g_saves[idx].is_usb) {
+        snprintf(err, err_sz, "Invalid system save index");
+        return -1;
+    }
+    save_entry_t *s = &g_saves[idx];
+    zip_file_t files[2];
+    char names[2][512];
+    char bin_path[MAX_PATH_LEN] = {0};
+    int nfiles = 0;
+    if (cloud_build_single_files(s, files, names, bin_path, &nfiles) < 0) {
+        snprintf(err, err_sz, "Cannot read save file");
+        return -1;
+    }
+    char stamp[32], safe_save[128];
+    cloud_timestamp(stamp, sizeof(stamp));
+    snprintf(safe_save, sizeof(safe_save), "%s", s->save_name);
+    sanitize_filename(safe_save);
+    snprintf(filename, filename_sz, "%s_%s_%s_enc.zip", stamp, s->title_id, safe_save);
+    sanitize_filename(filename);
+    return cloud_zip_files_to_memory(files, nfiles, iobuf, out, err, err_sz);
+}
+
+static int cloud_package_title(const char *title_id, char *iobuf, mem_buf_t *out,
+                               char *filename, size_t filename_sz,
+                               char *err, size_t err_sz) {
+    scan_saves();
+    zip_file_t *zfiles = NULL;
+    char **names = NULL, **allocs = NULL;
+    int nfiles = 0, nallocs = 0;
+    if (cloud_collect_title_files(title_id, &zfiles, &names, &allocs,
+                                  &nfiles, &nallocs, err, err_sz) < 0) {
+        return -1;
+    }
+    char stamp[32];
+    cloud_timestamp(stamp, sizeof(stamp));
+    snprintf(filename, filename_sz, "%s_%s_all_enc.zip", stamp, title_id);
+    sanitize_filename(filename);
+    int ret = cloud_zip_files_to_memory(zfiles, nfiles, iobuf, out, err, err_sz);
+    cloud_free_title_files(names, allocs, nfiles, nallocs, zfiles);
+    return ret;
+}
+
+typedef struct {
+    char title_id[32];
+    uint64_t sig;
+} auto_snapshot_t;
+
+typedef struct {
+    int watcher_running;
+    int lnc_available;
+    int lnc_saw_title;
+    int fallback_mode;
+    char current_title[32];
+    char last_closed[32];
+    char last_result[256];
+    time_t last_event;
+} auto_state_t;
+
+static pthread_mutex_t g_auto_mtx = PTHREAD_MUTEX_INITIALIZER;
+static auto_state_t g_auto_state = {0};
+static auto_snapshot_t g_auto_snaps[CLOUD_MAX_TITLES];
+static int g_auto_snap_count = 0;
+
+static int g_lnc_saw_title = 0;
+
+static void auto_set_result(const char *title_id, const char *fmt, ...) {
+    pthread_mutex_lock(&g_auto_mtx);
+    if (title_id) snprintf(g_auto_state.last_closed, sizeof(g_auto_state.last_closed), "%s", title_id);
+    g_auto_state.last_event = time(NULL);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_auto_state.last_result, sizeof(g_auto_state.last_result), fmt, ap);
+    va_end(ap);
+    pthread_mutex_unlock(&g_auto_mtx);
+}
+
+static int auto_get_running_title(char *title_id, size_t title_sz, int *out_app_id) {
+    title_id[0] = 0;
+    if (out_app_id) *out_app_id = 0;
+    int app_id = sceSystemServiceGetAppIdOfRunningBigApp();
+    if (app_id <= 0) return 0;
+    char tid[16] = {0};
+    sceLncUtilGetAppTitleId((unsigned int)app_id, tid);
+    if (!tid[0]) return 0;
+    snprintf(title_id, title_sz, "%s", tid);
+    if (out_app_id) *out_app_id = app_id;
+    return 1;
+}
+
+static auto_snapshot_t *auto_snapshot_for(const char *title_id) {
+    for (int i = 0; i < g_auto_snap_count; i++)
+        if (strcmp(g_auto_snaps[i].title_id, title_id) == 0) return &g_auto_snaps[i];
+    if (g_auto_snap_count >= CLOUD_MAX_TITLES) return NULL;
+    auto_snapshot_t *s = &g_auto_snaps[g_auto_snap_count++];
+    memset(s, 0, sizeof(*s));
+    snprintf(s->title_id, sizeof(s->title_id), "%s", title_id);
+    return s;
+}
+
+static uint64_t auto_title_signature(const char *title_id) {
+    uint64_t sig = 1469598103934665603ULL;
+    for (int i = 0; i < g_save_count; i++) {
+        save_entry_t *s = &g_saves[i];
+        if (s->is_usb || strcmp(s->title_id, title_id) != 0) continue;
+        struct stat st;
+        if (stat(s->path, &st) < 0) continue;
+        const unsigned char *p = (const unsigned char *)s->save_name;
+        while (*p) { sig ^= *p++; sig *= 1099511628211ULL; }
+        p = (const unsigned char *)s->user_id;
+        while (*p) { sig ^= *p++; sig *= 1099511628211ULL; }
+        sig ^= (uint64_t)st.st_size; sig *= 1099511628211ULL;
+        sig ^= (uint64_t)st.st_mtime; sig *= 1099511628211ULL;
+    }
+    return sig;
+}
+
+static int cloud_queue_count(void) {
+    int count = 0;
+    DIR *d = opendir(CLOUD_QUEUE_DIR);
+    if (!d) return 0;
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        size_t len = strlen(ent->d_name);
+        if (len > 4 && strcmp(ent->d_name + len - 4, ".zip") == 0) count++;
+    }
+    closedir(d);
+    return count;
+}
+
+static int cloud_queue_title_locked(const char *title_id, char *err, size_t err_sz) {
+    mkdir("/data", 0777);
+    mkdir("/data/garlic", 0777);
+    mkdir(CLOUD_QUEUE_DIR, 0777);
+    char *iobuf = malloc(BUF_SIZE);
+    if (!iobuf) { snprintf(err, err_sz, "Out of memory"); return -1; }
+    mem_buf_t pkg;
+    char filename[256];
+    int ret = cloud_package_title(title_id, iobuf, &pkg, filename, sizeof(filename), err, err_sz);
+    free(iobuf);
+    if (ret < 0) return -1;
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s/%s", CLOUD_QUEUE_DIR, filename);
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd < 0) {
+        free(pkg.data);
+        snprintf(err, err_sz, "Cannot create queue file");
+        return -1;
+    }
+    size_t off = 0;
+    while (off < pkg.len) {
+        ssize_t wr = write(fd, pkg.data + off, pkg.len - off);
+        if (wr <= 0) { close(fd); free(pkg.data); snprintf(err, err_sz, "Queue write failed"); return -1; }
+        off += wr;
+    }
+    close(fd);
+    free(pkg.data);
+    return 0;
+}
+
+static int auto_trigger_title(const char *title_id, const cloud_config_t *cfg) {
+    char err[256] = {0};
+    if (!cloud_title_is_watched(cfg, title_id)) return 0;
+    if (strcmp(cfg->provider, "ftp") == 0) {
+        cloud_job_args_t *job = calloc(1, sizeof(*job));
+        if (!job) { auto_set_result(title_id, "Auto backup failed: out of memory"); return -1; }
+        job->is_title = 1;
+        snprintf(job->title_id, sizeof(job->title_id), "%s", title_id);
+        if (cloud_start_job(job, err, sizeof(err)) < 0) {
+            free(job);
+            auto_set_result(title_id, "Auto FTP backup failed: %s", err);
+            return -1;
+        }
+        auto_set_result(title_id, "Auto FTP backup started");
+        return 0;
+    }
+    if (strcmp(cfg->provider, "google_drive") == 0 && cfg->auto_backup.queue_for_browser_drive) {
+        pthread_mutex_lock(&g_mtx);
+        scan_saves();
+        int ret = cloud_queue_title_locked(title_id, err, sizeof(err));
+        pthread_mutex_unlock(&g_mtx);
+        if (ret < 0) {
+            auto_set_result(title_id, "Auto Drive queue failed: %s", err);
+            return -1;
+        }
+        auto_set_result(title_id, "Queued Google Drive backup");
+        return 0;
+    }
+    auto_set_result(title_id, "Auto backup skipped for provider %s", cfg->provider);
+    return 0;
+}
+
+static void auto_snapshot_title_locked(const char *title_id) {
+    auto_snapshot_t *snap = auto_snapshot_for(title_id);
+    if (!snap) return;
+    snap->sig = auto_title_signature(title_id);
+}
+
+static void auto_on_title_closed(const char *closed, const cloud_config_t *cfg) {
+    auto_set_result(closed, "Detected title close; waiting %ds for save settle",
+                    cfg->auto_backup.settle_seconds);
+    logprintf("[GarlicMgr] Auto: title closed %s, settling %ds\n",
+              closed, cfg->auto_backup.settle_seconds);
+    sleep(cfg->auto_backup.settle_seconds);
+    pthread_mutex_lock(&g_mtx);
+    scan_saves();
+    auto_snapshot_t *snap = auto_snapshot_for(closed);
+    uint64_t sig = auto_title_signature(closed);
+    int changed = (!snap || sig != snap->sig);
+    if (snap) snap->sig = sig;
+    pthread_mutex_unlock(&g_mtx);
+    if (changed) {
+        logprintf("[GarlicMgr] Auto: saves changed for %s, uploading\n", closed);
+        auto_trigger_title(closed, cfg);
+    } else {
+        auto_set_result(closed, "No save changes detected after close");
+        logprintf("[GarlicMgr] Auto: no save changes for %s\n", closed);
+    }
+}
+
+static void *auto_watcher_thread(void *arg) {
+    (void)arg;
+    char last_running[32] = {0};
+    int last_app_id = 0;
+    pthread_mutex_lock(&g_auto_mtx);
+    g_auto_state.watcher_running = 1;
+    g_auto_state.lnc_available = 1;
+    g_auto_state.fallback_mode = 0;
+    pthread_mutex_unlock(&g_auto_mtx);
+
+    while (1) {
+        cloud_config_t cfg;
+        char err[256] = {0};
+        if (cloud_load_config(&cfg, err, sizeof(err)) == 0 && cfg.enabled && cfg.auto_backup.enabled) {
+            char running[32] = {0};
+            int app_id = 0;
+            int has_running = auto_get_running_title(running, sizeof(running), &app_id);
+            int watched = has_running && cloud_title_is_watched(&cfg, running);
+
+            pthread_mutex_lock(&g_auto_mtx);
+            snprintf(g_auto_state.current_title, sizeof(g_auto_state.current_title),
+                     "%s", has_running ? running : "");
+            if (watched) {
+                g_lnc_saw_title = 1;
+                g_auto_state.lnc_saw_title = 1;
+            }
+            pthread_mutex_unlock(&g_auto_mtx);
+
+            if (watched) {
+                if (strcmp(last_running, running) != 0 || last_app_id != app_id) {
+                    pthread_mutex_lock(&g_mtx);
+                    scan_saves();
+                    auto_snapshot_title_locked(running);
+                    pthread_mutex_unlock(&g_mtx);
+                    snprintf(last_running, sizeof(last_running), "%s", running);
+                    last_app_id = app_id;
+                    auto_set_result(running, "Watching running title %s", running);
+                    logprintf("[GarlicMgr] Auto: watching %s (app 0x%x)\n", running, app_id);
+                }
+            } else if (last_running[0] && (!has_running || app_id != last_app_id)) {
+                char closed[32];
+                snprintf(closed, sizeof(closed), "%s", last_running);
+                last_running[0] = 0;
+                last_app_id = 0;
+                auto_on_title_closed(closed, &cfg);
+            }
+            sleep(cfg.auto_backup.poll_seconds);
+        } else {
+            pthread_mutex_lock(&g_auto_mtx);
+            g_auto_state.current_title[0] = 0;
+            if (err[0]) snprintf(g_auto_state.last_result, sizeof(g_auto_state.last_result), "%s", err);
+            pthread_mutex_unlock(&g_auto_mtx);
+            sleep(5);
+        }
+    }
+    return NULL;
+}
+
+static void start_auto_watcher(void) {
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
+    if (pthread_create(&tid, &attr, auto_watcher_thread, NULL) == 0) pthread_detach(tid);
+    pthread_attr_destroy(&attr);
+}
+
+static void *cloud_upload_thread(void *arg) {
+    cloud_job_args_t *job = (cloud_job_args_t *)arg;
+    char err[256] = {0};
+    char remote_dir[768] = {0};
+    char remote_name[256] = {0};
+    char remote_full[1024] = {0};
+    cloud_config_t cfg;
+
+    if (cloud_load_config(&cfg, err, sizeof(err)) < 0) {
+        cloud_set_done(0, err, NULL);
+        free(job);
+        return NULL;
+    }
+    if (!cfg.enabled) {
+        cloud_set_done(0, "Cloud backup is disabled in config", NULL);
+        free(job);
+        return NULL;
+    }
+    if (strcmp(cfg.provider, "google_drive") == 0) {
+        if (strcmp(cfg.drive.mode, "browser") == 0) {
+            cloud_set_done(0, "Google Drive browser mode uploads from the web UI; use Settings and Cloud Backup again", NULL);
+        } else {
+            cloud_set_done(0, "Direct Google Drive needs HTTPS/TLS support not available in this payload build", NULL);
+        }
+        free(job);
+        return NULL;
+    }
+
+    char *iobuf = malloc(BUF_SIZE);
+    if (!iobuf) {
+        cloud_set_done(0, "Out of memory", NULL);
+        free(job);
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_mtx);
+    if (g_mounted) unmount_save();
+    scan_saves();
+    cloud_set_progress(10, NULL);
+
+    int ret = -1;
+    int mtx_locked = 1;
+    zip_file_t *upload_files = NULL;
+    int upload_nfiles = 0;
+    zip_file_t *zfiles = NULL;
+    char **names = NULL, **allocs = NULL;
+    int nfiles = 0, nallocs = 0;
+    char **path_copies = NULL;
+    int path_copy_count = 0;
+    zip_file_t files[2];
+    char file_names[2][512];
+    char bin_path[MAX_PATH_LEN] = {0};
+
+    if (job->is_title) {
+        if (!cloud_title_is_watched(&cfg, job->title_id)) {
+            snprintf(err, sizeof(err), "Title %s is not in watch_titles", job->title_id);
+        } else if (cloud_collect_title_files(job->title_id, &zfiles, &names, &allocs,
+                                              &nfiles, &nallocs, err, sizeof(err)) == 0) {
+            char stamp[32];
+            cloud_timestamp(stamp, sizeof(stamp));
+            cloud_remote_dir(&cfg, job->title_id, "all", remote_dir, sizeof(remote_dir));
+            snprintf(remote_name, sizeof(remote_name), "%s_%s_all_enc.zip", stamp, job->title_id);
+            sanitize_filename(remote_name);
+            snprintf(remote_full, sizeof(remote_full), "%s/%s", remote_dir, remote_name);
+            cloud_set_progress(25, remote_full);
+            path_copies = calloc((size_t)nfiles, sizeof(char *));
+            if (!path_copies) {
+                snprintf(err, sizeof(err), "Out of memory");
+            } else {
+                for (int i = 0; i < nfiles; i++) {
+                    path_copies[i] = strdup(zfiles[i].path);
+                    if (!path_copies[i]) {
+                        snprintf(err, sizeof(err), "Out of memory");
+                        break;
+                    }
+                    zfiles[i].path = path_copies[i];
+                }
+                if (!err[0]) {
+                    upload_files = zfiles;
+                    upload_nfiles = nfiles;
+                    path_copy_count = nfiles;
+                }
+            }
+        }
+    } else {
+        save_entry_t *s = NULL;
+        for (int i = 0; i < g_save_count; i++) {
+            if (!g_saves[i].is_usb &&
+                strcmp(g_saves[i].path, job->save.path) == 0 &&
+                strcmp(g_saves[i].title_id, job->save.title_id) == 0) {
+                s = &g_saves[i];
+                break;
+            }
+        }
+        if (!s) {
+            snprintf(err, sizeof(err), "Save no longer exists");
+        } else if (!cloud_title_is_watched(&cfg, s->title_id)) {
+            snprintf(err, sizeof(err), "Title %s is not in watch_titles", s->title_id);
+        } else if (cloud_build_single_files(&job->save, files, file_names, bin_path, &nfiles) == 0) {
+            char stamp[32], safe_save[128];
+            cloud_timestamp(stamp, sizeof(stamp));
+            snprintf(safe_save, sizeof(safe_save), "%s", s->save_name);
+            sanitize_filename(safe_save);
+            cloud_remote_dir(&cfg, s->title_id, s->user_id, remote_dir, sizeof(remote_dir));
+            snprintf(remote_name, sizeof(remote_name), "%s_%s_%s_enc.zip",
+                     stamp, s->title_id, safe_save);
+            sanitize_filename(remote_name);
+            snprintf(remote_full, sizeof(remote_full), "%s/%s", remote_dir, remote_name);
+            cloud_set_progress(25, remote_full);
+            upload_files = files;
+            upload_nfiles = nfiles;
+        } else {
+            snprintf(err, sizeof(err), "Cannot read save file");
+        }
+    }
+
+    if (mtx_locked) {
+        pthread_mutex_unlock(&g_mtx);
+        mtx_locked = 0;
+    }
+
+    if (upload_files && upload_nfiles > 0 && !err[0])
+        ret = cloud_upload_zip_files(&cfg, remote_dir, remote_name, upload_files, upload_nfiles,
+                                     iobuf, err, sizeof(err));
+
+    if (path_copies) {
+        for (int i = 0; i < path_copy_count; i++) free(path_copies[i]);
+        free(path_copies);
+    }
+    if (zfiles)
+        cloud_free_title_files(names, allocs, nfiles, nallocs, zfiles);
+    free(iobuf);
+
+    if (ret == 0) {
+        logprintf("[GarlicMgr] Cloud upload complete: %s\n", remote_full);
+        notify("Garlic SaveMgr: cloud backup complete");
+        cloud_set_done(1, NULL, remote_full);
+    } else {
+        logprintf("[GarlicMgr] Cloud upload failed: %s\n", err);
+        notify("Garlic SaveMgr: cloud backup failed");
+        cloud_set_done(0, err[0] ? err : "Cloud upload failed", remote_full);
+    }
+    free(job);
+    return NULL;
+}
+
+static int cloud_start_job(cloud_job_args_t *job, char *err, size_t err_sz) {
+    pthread_mutex_lock(&g_cloud_mtx);
+    if (g_cloud_state.running) {
+        pthread_mutex_unlock(&g_cloud_mtx);
+        snprintf(err, err_sz, "Cloud upload already running");
+        return -1;
+    }
+    pthread_mutex_unlock(&g_cloud_mtx);
+
+    char active[128];
+    if (job->is_title)
+        snprintf(active, sizeof(active), "Uploading title %s", job->title_id);
+    else
+        snprintf(active, sizeof(active), "Uploading %s/%s", job->save.title_id, job->save.save_name);
+    cloud_set_running(active);
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
+    if (pthread_create(&tid, &attr, cloud_upload_thread, job) != 0) {
+        pthread_attr_destroy(&attr);
+        cloud_set_done(0, "Failed to start cloud upload thread", NULL);
+        snprintf(err, err_sz, "Failed to start cloud upload thread");
+        return -1;
+    }
+    pthread_detach(tid);
+    pthread_attr_destroy(&attr);
+    return 0;
 }
 
 /* ── Zip extraction (upload) ────────────────────────────────────── */
@@ -1447,11 +3066,418 @@ static void http_json(int sock, const char *json) {
     http_send(sock, "200 OK", "application/json", json, strlen(json));
 }
 
+static int read_request_body(int sock, char *req, int n, char *iobuf,
+                             char **out, size_t *out_len, char *err, size_t err_sz) {
+    *out = NULL;
+    *out_len = 0;
+    size_t clen = 0;
+    char *cl = strcasestr(req, "Content-Length:");
+    if (cl) clen = strtoul(cl + 15, NULL, 10);
+    if (clen == 0 || clen > 64 * 1024) {
+        snprintf(err, err_sz, "Invalid settings body size");
+        return -1;
+    }
+    char *body_start = strstr(req, "\r\n\r\n");
+    if (!body_start) {
+        snprintf(err, err_sz, "Bad request");
+        return -1;
+    }
+    body_start += 4;
+    size_t body_in_buf = n - (body_start - req);
+    if (body_in_buf > clen) body_in_buf = clen;
+    char *body = malloc(clen + 1);
+    if (!body) {
+        snprintf(err, err_sz, "Out of memory");
+        return -1;
+    }
+    memcpy(body, body_start, body_in_buf);
+    size_t got = body_in_buf;
+    while (got < clen) {
+        size_t want = BUF_SIZE < (clen - got) ? BUF_SIZE : (clen - got);
+        ssize_t r = recv_all(sock, iobuf, want);
+        if (r <= 0) break;
+        memcpy(body + got, iobuf, r);
+        got += r;
+    }
+    body[got] = 0;
+    *out = body;
+    *out_len = got;
+    if (got != clen) {
+        snprintf(err, err_sz, "Request body was incomplete");
+        return -1;
+    }
+    return 0;
+}
+
+static void cloud_send_settings(int sock) {
+    cloud_config_t cfg;
+    char err[256] = {0};
+    int ok = (cloud_load_config(&cfg, err, sizeof(err)) == 0);
+    if (!ok) {
+        memset(&cfg, 0, sizeof(cfg));
+        snprintf(cfg.provider, sizeof(cfg.provider), "ftp");
+        snprintf(cfg.drive.mode, sizeof(cfg.drive.mode), "browser");
+        cfg.ftp.port = 21;
+        snprintf(cfg.ftp.remote_path, sizeof(cfg.ftp.remote_path), "/");
+        char *raw = NULL;
+        if (read_file_limited(CLOUD_CONFIG_PATH, &raw, 64 * 1024) == 0) {
+            char parse_err[128] = {0};
+            cloud_parse_config_text(raw, &cfg, parse_err, sizeof(parse_err));
+            free(raw);
+        }
+    }
+    char cfg_json[32768], err_esc[512], json[34000];
+    cloud_config_to_json(&cfg, cfg_json, sizeof(cfg_json), 1);
+    json_escape(err, err_esc, sizeof(err_esc));
+    snprintf(json, sizeof(json),
+        "{\"ok\":true,\"exists\":%s,\"config_error\":\"%s\","
+        "\"direct_drive_supported\":false,\"config\":%s}",
+        ok ? "true" : "false", err_esc, cfg_json);
+    http_json(sock, json);
+}
+
+static void cloud_handle_settings_post(int sock, char *iobuf, char *req, int n) {
+    char err[256] = {0};
+    char *body = NULL;
+    size_t body_len = 0;
+    if (read_request_body(sock, req, n, iobuf, &body, &body_len, err, sizeof(err)) < 0) {
+        char eesc[512], json[768];
+        json_escape(err, eesc, sizeof(eesc));
+        snprintf(json, sizeof(json), "{\"error\":\"%s\"}", eesc);
+        http_json(sock, json);
+        free(body);
+        return;
+    }
+
+    cloud_config_t cfg, old_cfg;
+    char old_err[128];
+    cloud_config_t *oldp = NULL;
+    if (cloud_load_config(&old_cfg, old_err, sizeof(old_err)) == 0) oldp = &old_cfg;
+    if (cloud_parse_config_text(body, &cfg, err, sizeof(err)) < 0) {
+        char eesc[512], json[768];
+        json_escape(err, eesc, sizeof(eesc));
+        snprintf(json, sizeof(json), "{\"error\":\"%s\"}", eesc);
+        http_json(sock, json);
+        free(body);
+        return;
+    }
+    cloud_merge_secrets(&cfg, oldp);
+    if (cloud_save_config(&cfg, err, sizeof(err)) < 0) {
+        char eesc[512], json[768];
+        json_escape(err, eesc, sizeof(eesc));
+        snprintf(json, sizeof(json), "{\"error\":\"%s\"}", eesc);
+        http_json(sock, json);
+        free(body);
+        return;
+    }
+    free(body);
+    http_json(sock, "{\"ok\":true}");
+}
+
+static void cloud_send_package_response(int sock, const char *filename, const mem_buf_t *pkg) {
+    char hdr[1024];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/zip\r\n"
+        "Content-Disposition: attachment; filename=\"%s\"\r\n"
+        "Content-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Expose-Headers: Content-Disposition\r\n"
+        "Connection: close\r\n\r\n",
+        filename, pkg->len);
+    send(sock, hdr, hlen, 0);
+    send_all_fd(sock, pkg->data, pkg->len);
+}
+
+static void cloud_send_status(int sock) {
+    cloud_config_t cfg;
+    char cfg_err[256] = {0};
+    int cfg_ok = (cloud_load_config(&cfg, cfg_err, sizeof(cfg_err)) == 0);
+
+    cloud_state_t st;
+    pthread_mutex_lock(&g_cloud_mtx);
+    st = g_cloud_state;
+    pthread_mutex_unlock(&g_cloud_mtx);
+
+    char provider[64], mode[64], host[512], remote[1024], active[256], last_err[512], last_path[1024], cfg_err_esc[512];
+    json_escape(cfg_ok ? cfg.provider : "", provider, sizeof(provider));
+    json_escape(cfg_ok ? cfg.drive.mode : "", mode, sizeof(mode));
+    json_escape(cfg_ok ? cfg.ftp.host : "", host, sizeof(host));
+    json_escape(cfg_ok ? cfg.ftp.remote_path : "", remote, sizeof(remote));
+    json_escape(st.active, active, sizeof(active));
+    json_escape(st.last_error, last_err, sizeof(last_err));
+    json_escape(st.last_remote, last_path, sizeof(last_path));
+    json_escape(cfg_err, cfg_err_esc, sizeof(cfg_err_esc));
+
+    char json[3072];
+    snprintf(json, sizeof(json),
+        "{\"config_ok\":%s,\"enabled\":%s,\"provider\":\"%s\",\"drive_mode\":\"%s\","
+        "\"host\":\"%s\",\"port\":%d,"
+        "\"remote_path\":\"%s\",\"use_tls\":%s,\"watch_count\":%d,"
+        "\"direct_drive_supported\":false,"
+        "\"running\":%s,\"progress\":%d,\"active\":\"%s\","
+        "\"last_ok\":%s,\"last_error\":\"%s\",\"last_remote\":\"%s\","
+        "\"config_error\":\"%s\"}",
+        cfg_ok ? "true" : "false",
+        (cfg_ok && cfg.enabled) ? "true" : "false",
+        provider,
+        mode,
+        host,
+        cfg_ok ? cfg.ftp.port : 0,
+        remote,
+        (cfg_ok && cfg.ftp.use_tls) ? "true" : "false",
+        cfg_ok ? cfg.watch_title_count : 0,
+        st.running ? "true" : "false",
+        st.progress,
+        active,
+        st.last_ok ? "true" : "false",
+        last_err,
+        last_path,
+        cfg_err_esc);
+    http_json(sock, json);
+}
+
+static void cloud_send_test_ftp(int sock) {
+    cloud_config_t cfg;
+    char err[512] = {0};
+    if (net_init_once() < 0) {
+        http_json(sock, "{\"ok\":false,\"stage\":\"net\",\"error\":\"PS5 network init (sceNetInit) failed\"}");
+        return;
+    }
+    if (cloud_load_config(&cfg, err, sizeof(err)) < 0) {
+        char eesc[512], json[768];
+        json_escape(err, eesc, sizeof(eesc));
+        snprintf(json, sizeof(json), "{\"ok\":false,\"stage\":\"config\",\"error\":\"%s\"}", eesc);
+        http_json(sock, json);
+        return;
+    }
+    if (!cfg.enabled) {
+        http_json(sock, "{\"ok\":false,\"stage\":\"config\",\"error\":\"Cloud backup is disabled\"}");
+        return;
+    }
+    if (strcmp(cfg.provider, "ftp") != 0) {
+        http_json(sock, "{\"ok\":false,\"stage\":\"config\",\"error\":\"Provider is not FTP\"}");
+        return;
+    }
+
+    ftp_client_t ftp;
+    if (ftp_connect_login(&ftp, &cfg.ftp, err, sizeof(err)) < 0) {
+        char eesc[512], json[768];
+        json_escape(err, eesc, sizeof(eesc));
+        snprintf(json, sizeof(json),
+            "{\"ok\":false,\"stage\":\"control\",\"host\":\"%s\",\"port\":%d,\"error\":\"%s\"}",
+            cfg.ftp.host, cfg.ftp.port, eesc);
+        http_json(sock, json);
+        return;
+    }
+
+    int data = ftp_pasv_connect(&ftp, err, sizeof(err));
+    if (data < 0) {
+        ftp_close(&ftp);
+        char eesc[512], json[768];
+        json_escape(err, eesc, sizeof(eesc));
+        snprintf(json, sizeof(json),
+            "{\"ok\":false,\"stage\":\"passive\",\"host\":\"%s\",\"port\":%d,\"error\":\"%s\"}",
+            cfg.ftp.host, cfg.ftp.port, eesc);
+        http_json(sock, json);
+        return;
+    }
+    close(data);
+    ftp_close(&ftp);
+
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{\"ok\":true,\"host\":\"%s\",\"port\":%d,\"message\":\"FTP control login and passive data port OK\"}",
+        cfg.ftp.host, cfg.ftp.port);
+    http_json(sock, json);
+}
+
+static void cloud_send_auto_status(int sock) {
+    auto_state_t st;
+    pthread_mutex_lock(&g_auto_mtx);
+    st = g_auto_state;
+    pthread_mutex_unlock(&g_auto_mtx);
+
+    cloud_config_t cfg;
+    char cfg_err[256] = {0};
+    int cfg_ok = (cloud_load_config(&cfg, cfg_err, sizeof(cfg_err)) == 0);
+
+    char cur[80], closed[80], result[512], cfg_err_esc[256];
+    json_escape(st.current_title, cur, sizeof(cur));
+    json_escape(st.last_closed, closed, sizeof(closed));
+    json_escape(st.last_result, result, sizeof(result));
+    json_escape(cfg_err, cfg_err_esc, sizeof(cfg_err_esc));
+    char json[1536];
+    snprintf(json, sizeof(json),
+        "{\"watcher_running\":%s,\"lnc_available\":%s,\"lnc_saw_title\":%s,\"fallback_mode\":%s,"
+        "\"cloud_enabled\":%s,\"auto_enabled\":%s,\"config_error\":\"%s\","
+        "\"current_title\":\"%s\",\"last_closed\":\"%s\",\"last_result\":\"%s\","
+        "\"last_event\":%lld,\"pending_count\":%d}",
+        st.watcher_running ? "true" : "false",
+        st.lnc_available ? "true" : "false",
+        st.lnc_saw_title ? "true" : "false",
+        st.fallback_mode ? "true" : "false",
+        (cfg_ok && cfg.enabled) ? "true" : "false",
+        (cfg_ok && cfg.auto_backup.enabled) ? "true" : "false",
+        cfg_err_esc,
+        cur, closed, result, (long long)st.last_event, cloud_queue_count());
+    http_json(sock, json);
+}
+
+static int safe_queue_id(const char *id) {
+    if (!id || !id[0]) return 0;
+    for (const char *p = id; *p; p++) {
+        if (*p == '/' || *p == '\\' || *p == '.' || *p == ':' || *p == '\r' || *p == '\n')
+            return 0;
+    }
+    return 1;
+}
+
+static void cloud_send_queue(int sock) {
+    DIR *d = opendir(CLOUD_QUEUE_DIR);
+    char *json = malloc(64 * 1024);
+    if (!json) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+    int pos = snprintf(json, 64 * 1024, "{\"queue\":[");
+    int first = 1;
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) && pos < 63000) {
+            size_t len = strlen(ent->d_name);
+            if (len <= 4 || strcmp(ent->d_name + len - 4, ".zip") != 0) continue;
+            char path[MAX_PATH_LEN];
+            snprintf(path, sizeof(path), "%s/%s", CLOUD_QUEUE_DIR, ent->d_name);
+            struct stat st;
+            if (stat(path, &st) < 0) continue;
+            char id[256], escid[512];
+            snprintf(id, sizeof(id), "%.*s", (int)(len - 4), ent->d_name);
+            json_escape(id, escid, sizeof(escid));
+            pos += snprintf(json + pos, 64 * 1024 - pos,
+                "%s{\"id\":\"%s\",\"filename\":\"%s\",\"size\":%lld,\"mtime\":%lld}",
+                first ? "" : ",", escid, escid, (long long)st.st_size, (long long)st.st_mtime);
+            first = 0;
+        }
+        closedir(d);
+    }
+    snprintf(json + pos, 64 * 1024 - pos, "]}");
+    http_json(sock, json);
+    free(json);
+}
+
+static void cloud_queue_download(int sock, const char *id) {
+    if (!safe_queue_id(id)) { http_json(sock, "{\"error\":\"Invalid id\"}"); return; }
+    char path[MAX_PATH_LEN], filename[300];
+    snprintf(filename, sizeof(filename), "%s.zip", id);
+    snprintf(path, sizeof(path), "%s/%s", CLOUD_QUEUE_DIR, filename);
+    struct stat st;
+    if (stat(path, &st) < 0 || !S_ISREG(st.st_mode)) { http_json(sock, "{\"error\":\"Queue item not found\"}"); return; }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { http_json(sock, "{\"error\":\"Cannot read queue item\"}"); return; }
+    char hdr[1024];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/zip\r\n"
+        "Content-Disposition: attachment; filename=\"%s\"\r\n"
+        "Content-Length: %lld\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Expose-Headers: Content-Disposition\r\n"
+        "Connection: close\r\n\r\n",
+        filename, (long long)st.st_size);
+    send(sock, hdr, hlen, 0);
+    char *buf = malloc(BUF_SIZE);
+    if (buf) {
+        ssize_t nr;
+        while ((nr = read(fd, buf, BUF_SIZE)) > 0) {
+            if (send_all_fd(sock, buf, nr) < 0) break;
+        }
+        free(buf);
+    }
+    close(fd);
+}
+
+static void cloud_queue_done(int sock, const char *id) {
+    if (!safe_queue_id(id)) { http_json(sock, "{\"error\":\"Invalid id\"}"); return; }
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s/%s.zip", CLOUD_QUEUE_DIR, id);
+    if (unlink(path) < 0) { http_json(sock, "{\"error\":\"Queue delete failed\"}"); return; }
+    http_json(sock, "{\"ok\":true}");
+}
+
 /* ── Embedded Web UI (generated from src/ui.html via xxd -i) ──── */
 #include "ui.h"
 
 /* ── Request handler ────────────────────────────────────────────── */
 static void handle_request_inner(int sock, char *iobuf, char *req, int n);
+
+static void cloud_begin_upload_title(int sock, const char *url) {
+    char tid[64] = {0};
+    char mode[16] = "enc";
+    char *tp = strstr(url, "id=");
+    if (tp) url_param_decode(tp + 3, tid, sizeof(tid));
+    char *mp = strstr(url, "mode=");
+    if (mp) url_param_decode(mp + 5, mode, sizeof(mode));
+    if (!tid[0]) { http_json(sock, "{\"error\":\"Missing id\"}"); return; }
+    if (strcmp(mode, "enc") != 0) {
+        http_json(sock, "{\"error\":\"Only encrypted cloud backups are supported in Phase 1\"}");
+        return;
+    }
+
+    cloud_job_args_t *job = calloc(1, sizeof(*job));
+    if (!job) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+    job->is_title = 1;
+    snprintf(job->title_id, sizeof(job->title_id), "%s", tid);
+
+    char err[256] = {0};
+    if (cloud_start_job(job, err, sizeof(err)) < 0) {
+        free(job);
+        char eesc[512], json[768];
+        json_escape(err, eesc, sizeof(eesc));
+        snprintf(json, sizeof(json), "{\"error\":\"%s\"}", eesc);
+        http_json(sock, json);
+        return;
+    }
+    http_json(sock, "{\"ok\":true}");
+}
+
+static void cloud_begin_upload_save(int sock, const char *url) {
+    int idx = -1;
+    char mode[16] = "enc";
+    char *p = strstr(url, "idx=");
+    if (p) idx = atoi(p + 4);
+    char *mp = strstr(url, "mode=");
+    if (mp) url_param_decode(mp + 5, mode, sizeof(mode));
+    if (strcmp(mode, "enc") != 0) {
+        http_json(sock, "{\"error\":\"Only encrypted cloud backups are supported in Phase 1\"}");
+        return;
+    }
+
+    save_entry_t save;
+    memset(&save, 0, sizeof(save));
+    pthread_mutex_lock(&g_mtx);
+    scan_saves();
+    if (idx < 0 || idx >= g_save_count || g_saves[idx].is_usb) {
+        pthread_mutex_unlock(&g_mtx);
+        http_json(sock, "{\"error\":\"Invalid system save index\"}");
+        return;
+    }
+    save = g_saves[idx];
+    pthread_mutex_unlock(&g_mtx);
+
+    cloud_job_args_t *job = calloc(1, sizeof(*job));
+    if (!job) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+    job->is_title = 0;
+    job->save = save;
+
+    char err[256] = {0};
+    if (cloud_start_job(job, err, sizeof(err)) < 0) {
+        free(job);
+        char eesc[512], json[768];
+        json_escape(err, eesc, sizeof(eesc));
+        snprintf(json, sizeof(json), "{\"error\":\"%s\"}", eesc);
+        http_json(sock, json);
+        return;
+    }
+    http_json(sock, "{\"ok\":true}");
+}
 
 /* Thread entry — receives socket fd via malloc'd int */
 static void *request_thread(void *arg) {
@@ -1588,6 +3614,83 @@ static void *request_thread(void *arg) {
         snprintf(json, sizeof(json), "{\"open\":%s,\"name\":\"%s\",\"size\":%zu,\"dirty\":%s}",
             g_ed_buf ? "true" : "false", g_ed_name, g_ed_size, g_ed_dirty ? "true" : "false");
         http_json(sock, json);
+        close(sock);
+        return NULL;
+    }
+
+    /* Cloud endpoints stay responsive while a background upload runs */
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/cloud/status") == 0) {
+        cloud_send_status(sock);
+        close(sock);
+        return NULL;
+    }
+
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/cloud/test_ftp") == 0) {
+        cloud_send_test_ftp(sock);
+        close(sock);
+        return NULL;
+    }
+
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/settings/cloud") == 0) {
+        cloud_send_settings(sock);
+        close(sock);
+        return NULL;
+    }
+
+    if (strcmp(method, "POST") == 0 && strcmp(url, "/api/settings/cloud") == 0) {
+        char *iobuf = malloc(BUF_SIZE);
+        if (iobuf) {
+            cloud_handle_settings_post(sock, iobuf, req, n);
+            free(iobuf);
+        }
+        close(sock);
+        return NULL;
+    }
+
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/cloud/upload_title", 23) == 0) {
+        cloud_begin_upload_title(sock, url);
+        close(sock);
+        return NULL;
+    }
+
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/cloud/upload", 17) == 0) {
+        cloud_begin_upload_save(sock, url);
+        close(sock);
+        return NULL;
+    }
+
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/cloud/auto_status") == 0) {
+        cloud_send_auto_status(sock);
+        close(sock);
+        return NULL;
+    }
+
+    if (strcmp(method, "POST") == 0 && strcmp(url, "/api/cloud/auto_scan") == 0) {
+        http_json(sock, "{\"ok\":true,\"message\":\"Auto backup uses game-close detection only\"}");
+        close(sock);
+        return NULL;
+    }
+
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/cloud/queue") == 0) {
+        cloud_send_queue(sock);
+        close(sock);
+        return NULL;
+    }
+
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/cloud/queue_download", 25) == 0) {
+        char id[256] = {0};
+        char *ip = strstr(url, "id=");
+        if (ip) url_param_decode(ip + 3, id, sizeof(id));
+        cloud_queue_download(sock, id);
+        close(sock);
+        return NULL;
+    }
+
+    if (strcmp(method, "POST") == 0 && strncmp(url, "/api/cloud/queue_done", 21) == 0) {
+        char id[256] = {0};
+        char *ip = strstr(url, "id=");
+        if (ip) url_param_decode(ip + 3, id, sizeof(id));
+        cloud_queue_done(sock, id);
         close(sock);
         return NULL;
     }
@@ -2732,6 +4835,138 @@ static void handle_request_inner(int sock, char *iobuf, char *req, int n) {
             "{\"mounted\":%s,\"mount_point\":\"%s\",\"save_path\":\"%s\"}",
             g_mounted ? "true" : "false", g_mount_point, g_mounted_path);
         http_json(sock, json);
+        return;
+    }
+
+    /* GET/POST /api/settings/cloud -> read/write cloud backup settings */
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/settings/cloud") == 0) {
+        cloud_send_settings(sock);
+        return;
+    }
+    if (strcmp(method, "POST") == 0 && strcmp(url, "/api/settings/cloud") == 0) {
+        cloud_handle_settings_post(sock, iobuf, req, n);
+        return;
+    }
+
+    /* GET /api/cloud/status -> redacted config + background job status */
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/cloud/status") == 0) {
+        cloud_send_status(sock);
+        return;
+    }
+
+    /* Direct Google Drive OAuth placeholders: direct mode needs a TLS backend in this payload. */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/cloud/google/", 18) == 0) {
+        http_json(sock, "{\"error\":\"Direct Google Drive OAuth needs HTTPS/TLS support not available in this payload build\",\"direct_drive_supported\":false}");
+        return;
+    }
+
+    /* GET /api/cloud/package_title?id=<title_id> -> encrypted ZIP for browser Drive upload */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/cloud/package_title", 24) == 0) {
+        char tid[64] = {0};
+        char *tp = strstr(url, "id=");
+        if (tp) url_param_decode(tp + 3, tid, sizeof(tid));
+        if (!tid[0]) { http_json(sock, "{\"error\":\"Missing id\"}"); return; }
+
+        mem_buf_t pkg;
+        char filename[256], err[256] = {0};
+        if (cloud_package_title(tid, iobuf, &pkg, filename, sizeof(filename), err, sizeof(err)) < 0) {
+            char eesc[512], json[768];
+            json_escape(err, eesc, sizeof(eesc));
+            snprintf(json, sizeof(json), "{\"error\":\"%s\"}", eesc);
+            http_json(sock, json);
+            return;
+        }
+        cloud_send_package_response(sock, filename, &pkg);
+        free(pkg.data);
+        return;
+    }
+
+    /* GET /api/cloud/package?idx=N -> encrypted ZIP for browser Drive upload */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/cloud/package", 18) == 0) {
+        int idx = -1;
+        char *p = strstr(url, "idx=");
+        if (p) idx = atoi(p + 4);
+
+        mem_buf_t pkg;
+        char filename[256], err[256] = {0};
+        if (cloud_package_single(idx, iobuf, &pkg, filename, sizeof(filename), err, sizeof(err)) < 0) {
+            char eesc[512], json[768];
+            json_escape(err, eesc, sizeof(eesc));
+            snprintf(json, sizeof(json), "{\"error\":\"%s\"}", eesc);
+            http_json(sock, json);
+            return;
+        }
+        cloud_send_package_response(sock, filename, &pkg);
+        free(pkg.data);
+        return;
+    }
+
+    /* GET /api/cloud/upload_title?id=<title_id>&mode=enc -> FTP encrypted title backup */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/cloud/upload_title", 23) == 0) {
+        char tid[64] = {0};
+        char mode[16] = "enc";
+        char *tp = strstr(url, "id=");
+        if (tp) url_param_decode(tp + 3, tid, sizeof(tid));
+        char *mp = strstr(url, "mode=");
+        if (mp) url_param_decode(mp + 5, mode, sizeof(mode));
+        if (!tid[0]) { http_json(sock, "{\"error\":\"Missing id\"}"); return; }
+        if (strcmp(mode, "enc") != 0) {
+            http_json(sock, "{\"error\":\"Only encrypted cloud backups are supported in Phase 1\"}");
+            return;
+        }
+
+        cloud_job_args_t *job = calloc(1, sizeof(*job));
+        if (!job) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        job->is_title = 1;
+        snprintf(job->title_id, sizeof(job->title_id), "%s", tid);
+
+        char err[256] = {0};
+        if (cloud_start_job(job, err, sizeof(err)) < 0) {
+            free(job);
+            char eesc[512], json[768];
+            json_escape(err, eesc, sizeof(eesc));
+            snprintf(json, sizeof(json), "{\"error\":\"%s\"}", eesc);
+            http_json(sock, json);
+            return;
+        }
+        http_json(sock, "{\"ok\":true}");
+        return;
+    }
+
+    /* GET /api/cloud/upload?idx=N&mode=enc -> FTP encrypted single-save backup */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/cloud/upload", 17) == 0) {
+        int idx = -1;
+        char mode[16] = "enc";
+        char *p = strstr(url, "idx=");
+        if (p) idx = atoi(p + 4);
+        char *mp = strstr(url, "mode=");
+        if (mp) url_param_decode(mp + 5, mode, sizeof(mode));
+        if (strcmp(mode, "enc") != 0) {
+            http_json(sock, "{\"error\":\"Only encrypted cloud backups are supported in Phase 1\"}");
+            return;
+        }
+
+        scan_saves();
+        if (idx < 0 || idx >= g_save_count || g_saves[idx].is_usb) {
+            http_json(sock, "{\"error\":\"Invalid system save index\"}");
+            return;
+        }
+
+        cloud_job_args_t *job = calloc(1, sizeof(*job));
+        if (!job) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        job->is_title = 0;
+        job->save = g_saves[idx];
+
+        char err[256] = {0};
+        if (cloud_start_job(job, err, sizeof(err)) < 0) {
+            free(job);
+            char eesc[512], json[768];
+            json_escape(err, eesc, sizeof(eesc));
+            snprintf(json, sizeof(json), "{\"error\":\"%s\"}", eesc);
+            http_json(sock, json);
+            return;
+        }
+        http_json(sock, "{\"ok\":true}");
         return;
     }
 
@@ -5499,7 +7734,12 @@ int main(void) {
     }
 
     printf("=== Garlic SaveMgr for PS5 by earthonion ===\n");
+    if (net_init_once() == 0)
+        printf("[GarlicMgr] sceNetInit OK (outbound FTP enabled)\n");
+    else
+        printf("[GarlicMgr] sceNetInit failed; cloud FTP uploads may not work\n");
     notify("Garlic SaveMgr: port %d", PORT);
+    start_auto_watcher();
 
     int srvfd = socket(AF_INET, SOCK_STREAM, 0);
     if (srvfd < 0) { perror("socket"); return 1; }
