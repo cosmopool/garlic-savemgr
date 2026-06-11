@@ -1,3 +1,4 @@
 *.elf
 src/ui.h
 src/sqlite3.o
+*.zip

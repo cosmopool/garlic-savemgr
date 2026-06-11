@@ -118,6 +118,32 @@
     .badge-bu { background:#c89b00; color:#000 }
     .badge-usb { background:#8b5cf6; color:#fff }
 
+    .bulk-bar {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px;
+      padding: 8px 10px; border-bottom: 1px solid var(--bd);
+      background: var(--s1); flex-shrink: 0;
+    }
+    .bulk-bar .bulk-all {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 10px; font-weight: 700; color: var(--dm);
+      text-transform: uppercase; letter-spacing: .4px; cursor: pointer;
+    }
+    .bulk-bar .bulk-count { font-size: 10px; color: var(--dm); min-width: 72px }
+    .bulk-bar .bulk-btn {
+      background: var(--bd); border: none; color: var(--tx);
+      font-size: 9px; font-weight: 700; padding: 5px 8px; border-radius: 10px;
+      cursor: pointer; letter-spacing: .3px; text-transform: uppercase;
+    }
+    .bulk-bar .bulk-btn:hover:not(:disabled) { background: var(--gl); color: #fff }
+    .bulk-bar .bulk-btn:disabled { opacity: .35; cursor: default }
+    .bulk-bar .bulk-btn.grn { background: rgba(0,180,90,.25); color: #6f6 }
+    .sv .bulk-cb {
+      margin: 0 8px 0 0; accent-color: var(--ac); width: 14px; height: 14px;
+      vertical-align: middle; flex-shrink: 0;
+    }
+    .sv .sv-row { display: flex; align-items: flex-start; }
+    .sv .sv-body { flex: 1; min-width: 0 }
+
     /* ── Right panel ─────────────────────────────────── */
     .right { flex: 1; display: flex; flex-direction: column; overflow: hidden }
 
@@ -473,6 +499,7 @@
   <button class="tab" onclick="switchTab('encrypt')">Encrypt</button>
   <button class="tab" onclick="switchTab('resign')">Resign</button>
   <button class="tab" onclick="switchTab('import')">Import</button>
+  <button class="tab" onclick="switchTab('settings')">Settings</button>
   <span class="spacer"></span>
   <button class="shut" onclick="shutdown()">Kill GarlicMgr</button>
   <span style="font-size:10px;color:#ffeb3b;margin-left:4px">__VERSION__</span>
@@ -484,6 +511,7 @@
   <button class="tab" onclick="switchTab('encrypt')">Encrypt</button>
   <button class="tab" onclick="switchTab('resign')">Resign</button>
   <button class="tab" onclick="switchTab('import')">Import</button>
+  <button class="tab" onclick="switchTab('settings')">Settings</button>
   <button class="shut" onclick="shutdown()">Kill GarlicMgr</button>
   <span style="font-size:10px;color:#ffeb3b">__VERSION__</span>
 </div>
@@ -495,6 +523,13 @@
       <span style="margin-right:auto">Saves</span>
       <button class="ptab active" id="ptab5" onclick="setPlatform('ps5')">PS5</button>
       <button class="ptab" id="ptab4" onclick="setPlatform('ps4')">PS4</button>
+    </div>
+    <div class="bulk-bar" id="bulkBar">
+      <label class="bulk-all"><input type="checkbox" id="bulkSelectAll" onchange="onBulkSelectAll(this.checked)"> All</label>
+      <span class="bulk-count" id="bulkCount">0 titles</span>
+      <button class="bulk-btn" onclick="bulkQueue('dec')" id="bulkDec" disabled>Decrypted</button>
+      <button class="bulk-btn" onclick="bulkQueue('enc')" id="bulkEnc" disabled>Encrypted</button>
+      <button class="bulk-btn grn" onclick="bulkQueue('cloud')" id="bulkCloud" disabled>Cloud</button>
     </div>
     <div class="drawer-toggle" onclick="toggleDrawer()" id="dtog"></div>
     <div class="svs" id="svs"><div class="empty">Loading...</div></div>
@@ -517,6 +552,8 @@ let S = [], si = -1, tab = 'browse';
 let mt = false, bsy = false;
 let cf = [], ex = new Set();
 let aid = '', stitle = '', mtid = '', mpt = '';
+let cloudPoll = null, cloudAwaiting = false, cloudBusy = false, lastCloudProgress = '';
+let bulkSel = new Set(), bulkRunning = false;
 
 /* ── Utilities ─────────────────────────────────────── */
 function $(id) { return document.getElementById(id) }
@@ -743,7 +780,7 @@ document.addEventListener('click', e => {
 /* ── Tab switching ─────────────────────────────────── */
 function switchTab(t) {
   tab = t;
-  const tabs = ['browse', 'decrypt', 'encrypt', 'resign', 'import'];
+  const tabs = ['browse', 'decrypt', 'encrypt', 'resign', 'import', 'settings'];
   document.querySelectorAll('nav .tab, .mob-menu .tab').forEach(b => {
     const idx = tabs.indexOf(b.textContent.trim().toLowerCase());
     b.className = 'tab' + (tabs[idx] === t ? ' active' : '');
@@ -762,6 +799,7 @@ async function load() {
     const r = await fetch('/api/saves');
     const d = await r.json();
     S = d.saves || [];
+    bulkSel.clear();
     renderL();
     renderTB();
     updateDrawer();
@@ -783,7 +821,56 @@ function setPlatform(p) {
   $('ptab5').className = 'ptab' + (p === 'ps5' ? ' active' : '');
   $('ptab4').className = 'ptab' + (p === 'ps4' ? ' active' : '');
   si = -1; mt = null; cf = [];
+  bulkSel.clear();
   renderL(); renderTB(); renderCt(); updateDrawer();
+}
+
+function bulkTitleCheckbox(titleId, anyUsb) {
+  if (anyUsb) return '<span style="width:22px;flex-shrink:0"></span>';
+  const on = bulkSel.has(titleId) ? ' checked' : '';
+  const tid = esc(titleId).replace(/'/g, "\\'");
+  return '<input type="checkbox" class="bulk-cb" onclick="event.stopPropagation();toggleBulkTitle(\'' + tid + '\')"' + on + '>';
+}
+
+function visibleBulkTitles() {
+  const ptype = platform === 'ps4' ? 'ps4' : 'ps5';
+  const ids = new Set();
+  S.forEach(s => {
+    if (s.type === ptype && !s.usb && s.uid === curUid) ids.add(s.title_id);
+  });
+  return [...ids].sort();
+}
+
+function toggleBulkTitle(titleId) {
+  if (bulkSel.has(titleId)) bulkSel.delete(titleId);
+  else bulkSel.add(titleId);
+  updateBulkBar();
+  renderL();
+}
+
+function onBulkSelectAll(checked) {
+  const vis = visibleBulkTitles();
+  if (checked) vis.forEach(t => bulkSel.add(t));
+  else vis.forEach(t => bulkSel.delete(t));
+  updateBulkBar();
+  renderL();
+}
+
+function updateBulkBar() {
+  const vis = visibleBulkTitles();
+  const n = vis.filter(t => bulkSel.has(t)).length;
+  const cnt = $('bulkCount');
+  if (cnt) cnt.textContent = n + (n === 1 ? ' title' : ' titles');
+  const all = $('bulkSelectAll');
+  if (all) {
+    all.checked = vis.length > 0 && n === vis.length;
+    all.indeterminate = n > 0 && n < vis.length;
+  }
+  const dis = bsy || bulkRunning || n === 0;
+  ['bulkDec', 'bulkEnc', 'bulkCloud'].forEach(id => {
+    const b = $(id);
+    if (b) b.disabled = dis;
+  });
 }
 
 function renderGroup(g, h) {
@@ -799,22 +886,25 @@ function renderGroup(g, h) {
     const i = g.items[0], s = S[i];
     const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
     h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
-    h += '<div class="tid">' + bu + badge + esc(g.name) + tdots + '</div>';
-    h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
+    h += '<div class="sv-row">' + bulkTitleCheckbox(g.title_id, anyUsb);
+    h += '<div class="sv-body"><div class="tid">' + bu + badge + esc(g.name) + tdots + '</div>';
+    h += '<div class="sn">' + esc(s.save_name) + '</div></div></div></div>';
   } else {
     const open = exG.has(gkey);
     const anySel = g.items.includes(si);
     const gesc = esc(gkey).replace(/'/g, "\\'");
     h += '<div class="sv' + (anySel ? ' sel' : '') + '" onclick="togG(\'' + gesc + '\',event)" style="cursor:pointer">';
-    h += '<div class="tid">' + badge + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + tdots + '</div>';
-    h += '<div class="sn">' + g.items.length + ' saves</div></div>';
+    h += '<div class="sv-row">' + bulkTitleCheckbox(g.title_id, anyUsb);
+    h += '<div class="sv-body"><div class="tid">' + badge + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + tdots + '</div>';
+    h += '<div class="sn">' + g.items.length + ' saves</div></div></div></div>';
     if (open) {
       g.items.forEach(i => {
         const s = S[i];
         const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
         const dots = saveDots(i);
-        h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')" style="padding-left:28px">';
-        h += '<div class="sn" style="color:var(--tx)">' + bu + esc(s.save_name) + dots + '</div></div>';
+        h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')" style="padding-left:16px">';
+        h += '<div class="sv-row"><span style="width:22px;flex-shrink:0"></span>';
+        h += '<div class="sv-body"><div class="sn" style="color:var(--tx)">' + bu + esc(s.save_name) + dots + '</div></div></div></div>';
       });
     }
   }
@@ -861,6 +951,7 @@ function renderL() {
   }
 
   $('svs').innerHTML = h;
+  updateBulkBar();
 }
 
 function togG(tid, e) {
@@ -929,6 +1020,9 @@ function renderCt() {
       + '<button class="bbtn" onclick="browseEncFile()">Browse File</button></div>';
     setupImportDZ('dz');
 
+  } else if (tab === 'settings') {
+    renderSettings();
+
   } else {
     if (mt) {
       c.className = 'ct';
@@ -938,6 +1032,562 @@ function renderCt() {
       c.innerHTML = '<div class="drop"><div class="dlbl">Select a save to browse<br><br>Tip: Drag & drop files onto a mounted save to add or replace them</div></div>';
     }
   }
+}
+
+function settingsInput(id, label, value, type, extra) {
+  return '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">' + label + '</label>'
+    + '<input id="' + id + '" type="' + (type || 'text') + '" value="' + esc(value || '') + '" ' + (extra || '')
+    + ' style="width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:8px;font-family:monospace;font-size:12px">';
+}
+
+function settingsTextarea(id, label, value, rows) {
+  return '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">' + label + '</label>'
+    + '<textarea id="' + id + '" rows="' + (rows || 6) + '" '
+    + 'style="width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:8px;font-family:monospace;font-size:12px;resize:vertical">'
+    + esc(value || '') + '</textarea>';
+}
+
+async function renderSettings() {
+  const c = $('ct');
+  c.className = 'ct';
+  c.innerHTML = '<div class="empty">Loading settings...</div>';
+  try {
+    const r = await fetch('/api/settings/cloud');
+    const d = await r.json();
+    const cfg = d.config || {};
+    const ftp = cfg.ftp || {};
+    const gd = cfg.google_drive || {};
+    const auto = cfg.auto_backup || {};
+    let driveAuth = gd.auth_mode || localStorage.getItem('gdrive_auth_mode') || 'oauth_refresh';
+    if (driveAuth === 'oauth_token') driveAuth = 'oauth_refresh';
+    const accessToken = gd.access_token || localStorage.getItem('gdrive_access_token') || '';
+    const storedSa = localStorage.getItem('gdrive_service_account') || '';
+    const saForTextarea = storedSa || ((gd.service_account && gd.service_account.private_key && gd.service_account.private_key !== '********') ? JSON.stringify(gd.service_account, null, 2) : '');
+    c.innerHTML =
+      '<div style="padding:18px;max-width:760px;width:100%">'
+      + '<div style="font-size:18px;font-weight:800;color:var(--tx);margin-bottom:4px">Settings</div>'
+      + '<div style="font-size:12px;color:var(--dm);margin-bottom:16px">Cloud backup settings are saved to /data/garlic/cloud.json. Password/private-key fields show ******** when already stored.</div>'
+      + '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:16px">'
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-bottom:12px">'
+      + '<input id="setEnabled" type="checkbox" ' + (cfg.enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Enable Cloud Backup</label>'
+      + '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">Provider</label>'
+      + '<select id="setProvider" onchange="updateSettingsVisibility()" style="width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:8px">'
+      + '<option value="ftp"' + ((cfg.provider || 'ftp') === 'ftp' ? ' selected' : '') + '>FTP</option>'
+      + '<option value="google_drive"' + (cfg.provider === 'google_drive' ? ' selected' : '') + '>Google Drive</option>'
+      + '</select>'
+      + settingsInput('setWatch', 'Watch Titles (comma separated, blank = all)', (cfg.watch_titles || []).join(', '))
+      + '<div id="ftpSettings" style="margin-top:14px">'
+      + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">FTP</div>'
+      + settingsInput('setFtpHost', 'Host', ftp.host || '')
+      + settingsInput('setFtpPort', 'Port', String(ftp.port || 21), 'number')
+      + settingsInput('setFtpUser', 'User', ftp.user || '')
+      + settingsInput('setFtpPass', 'Password', ftp.pass || '', 'password')
+      + settingsInput('setFtpPath', 'Remote Path', ftp.remote_path || '/')
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
+      + '<input id="setFtpTls" type="checkbox" ' + (ftp.use_tls ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Use TLS (currently rejected by backend)</label>'
+      + '</div>'
+      + '<div style="margin-top:14px">'
+      + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">Auto Backup</div>'
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
+      + '<input id="setAutoEnabled" type="checkbox" ' + (auto.enabled || auto.auto_enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Enable automatic backup after watched game closes</label>'
+      + settingsInput('setAutoPoll', 'Poll Interval Seconds', String(auto.poll_seconds || 5), 'number')
+      + settingsInput('setAutoSettle', 'Settle Delay Seconds After Close', String(auto.settle_seconds || 15), 'number')
+      + '<div style="font-size:10px;color:var(--dm);margin:-4px 0 8px">Upload runs once after a watched game closes, then waits this many seconds for saves to finish writing.</div>'
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
+      + '<input id="setAutoQueueDrive" type="checkbox" ' + (auto.queue_for_browser_drive !== false ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Queue Google Drive backups for browser upload</label>'
+      + '<div id="autoStatus" style="font-size:11px;color:var(--dm);margin-top:8px">Auto status loading...</div>'
+      + '</div>'
+      + '<div id="driveSettings" style="margin-top:14px">'
+      + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">Google Drive</div>'
+      + '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">Mode</label>'
+      + '<select id="setDriveMode" onchange="updateSettingsVisibility()" style="width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:8px">'
+      + '<option value="browser"' + ((gd.mode || 'browser') === 'browser' ? ' selected' : '') + '>Browser Assisted</option>'
+      + '<option value="direct"' + (gd.mode === 'direct' ? ' selected' : '') + '>Direct PS5 (requires TLS backend)</option>'
+      + '</select>'
+      + settingsInput('setDriveFolder', 'Folder ID (required)', gd.folder_id || '')
+      + '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">Browser Upload Auth</label>'
+      + '<select id="setDriveAuth" onchange="updateSettingsVisibility()" style="width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:8px">'
+      + '<option value="oauth_refresh"' + (driveAuth === 'oauth_refresh' ? ' selected' : '') + '>OAuth2 (Personal My Drive)</option>'
+      + '<option value="service_account"' + (driveAuth === 'service_account' ? ' selected' : '') + '>Service Account (Shared Drive only)</option>'
+      + '</select>'
+      + '<div id="driveOAuthRefreshSettings" style="margin-top:8px">'
+      + settingsInput('setDriveClientId', 'OAuth Client ID', gd.client_id || '')
+      + settingsInput('setDriveClientSecret', 'OAuth Client Secret', gd.client_secret || '', 'password')
+      + settingsInput('setDriveRefreshToken', 'OAuth Refresh Token', gd.refresh_token || '', 'password')
+      + settingsInput('setDriveAccessToken', 'OAuth Access Token', accessToken, 'password')
+      + '<div style="font-size:11px;color:var(--dm);margin-top:6px">All four values come from your Google OAuth client. Paste Client ID, Client Secret, Refresh Token, and Access Token from OAuth Playground (or your own OAuth flow). Saved to cloud.json on the PS5; secret and tokens show ******** when already stored.</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin-top:4px">When the access token expires (~1 hour), uploads auto-refresh it using the refresh token. Re-paste a new access token from Playground if refresh fails.</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin-top:4px">Setup: <a href="https://developers.google.com/oauthplayground/" target="_blank" rel="noopener" style="color:var(--ac)">Google OAuth Playground</a> → gear icon → use your OAuth credentials → Drive API v3 scope → Authorize → Exchange → copy both tokens.</div>'
+      + '</div>'
+      + '<div id="driveSaSettings" style="margin-top:8px">'
+      + settingsTextarea('setDriveServiceAccount', 'Service Account JSON (stored in this browser by default)', saForTextarea, 8)
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
+      + '<input id="setDriveSaveSa" type="checkbox" style="accent-color:var(--ac);width:16px;height:16px"> Also save service account to PS5 config</label>'
+      + '<div style="font-size:11px;color:var(--dm);margin-top:6px">Service accounts can upload only to Shared Drives or Workspace delegated drives. For normal My Drive folders, use OAuth2 above.</div>'
+      + '</div>'
+      + '<div id="directNote" style="font-size:11px;color:#c89b00;margin-top:8px">Direct PS5 Google Drive is configured here, but this payload build reports direct_drive_supported=false until a TLS backend is available.</div>'
+      + '</div>'
+      + '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:16px">'
+      + '<button class="btn grn" onclick="saveCloudSettings()">Save Settings</button>'
+      + '<button class="btn" onclick="testCloudSettings()">Test FTP / Status</button>'
+      + '<button class="btn" onclick="testDriveAccess()">Test Drive Access</button>'
+      + '<button class="btn" onclick="drainDriveQueue(true)">Upload Pending Drive Backups</button>'
+      + '</div>'
+      + '</div></div>';
+    updateSettingsVisibility();
+    refreshAutoStatus();
+    if (window.autoStatusTimer) clearInterval(window.autoStatusTimer);
+    window.autoStatusTimer = setInterval(refreshAutoStatus, 5000);
+    loadDriveQueueStatus();
+  } catch (e) {
+    c.innerHTML = '<div class="empty">Failed to load settings: ' + esc(e.message) + '</div>';
+  }
+}
+
+function updateSettingsVisibility() {
+  const p = $('setProvider') ? $('setProvider').value : 'ftp';
+  const m = $('setDriveMode') ? $('setDriveMode').value : 'browser';
+  const a = $('setDriveAuth') ? $('setDriveAuth').value : 'service_account';
+  if ($('ftpSettings')) $('ftpSettings').style.display = p === 'ftp' ? 'block' : 'none';
+  if ($('driveSettings')) $('driveSettings').style.display = p === 'google_drive' ? 'block' : 'none';
+  if ($('driveOAuthRefreshSettings')) $('driveOAuthRefreshSettings').style.display = (p === 'google_drive' && a === 'oauth_refresh') ? 'block' : 'none';
+  if ($('driveSaSettings')) $('driveSaSettings').style.display = (p === 'google_drive' && a === 'service_account') ? 'block' : 'none';
+  if ($('directNote')) $('directNote').style.display = (p === 'google_drive' && m === 'direct') ? 'block' : 'none';
+}
+
+function normalizeDriveToken(token) {
+  token = (token || '').trim();
+  if ((token[0] === '"' && token[token.length - 1] === '"') || (token[0] === "'" && token[token.length - 1] === "'")) {
+    token = token.slice(1, -1).trim();
+  }
+  if (token.toLowerCase().startsWith('bearer ')) token = token.slice(7).trim();
+  return token;
+}
+
+async function saveCloudSettings() {
+  const watch = ($('setWatch').value || '').split(',').map(x => x.trim()).filter(Boolean);
+  const driveAuth = $('setDriveAuth') ? $('setDriveAuth').value : 'oauth_refresh';
+  localStorage.setItem('gdrive_auth_mode', driveAuth);
+  const accessToken = normalizeDriveToken($('setDriveAccessToken') ? $('setDriveAccessToken').value : '');
+  if (accessToken && accessToken !== '********') localStorage.setItem('gdrive_access_token', accessToken);
+  const saText = ($('setDriveServiceAccount') ? $('setDriveServiceAccount').value : '').trim();
+  let serviceAccount = {};
+  if (driveAuth === 'service_account' && saText) {
+    try {
+      serviceAccount = JSON.parse(saText);
+      localStorage.setItem('gdrive_service_account', JSON.stringify(serviceAccount, null, 2));
+    } catch (e) {
+      log('Service account JSON is invalid: ' + e.message, 'err');
+      return;
+    }
+  }
+  const cfg = {
+    enabled: $('setEnabled').checked,
+    provider: $('setProvider').value,
+    watch_titles: watch,
+    ftp: {
+      host: $('setFtpHost').value.trim(),
+      port: parseInt($('setFtpPort').value || '21', 10),
+      user: $('setFtpUser').value.trim(),
+      pass: $('setFtpPass').value,
+      remote_path: $('setFtpPath').value.trim() || '/',
+      use_tls: $('setFtpTls').checked
+    },
+    google_drive: {
+      mode: $('setDriveMode').value,
+      auth_mode: driveAuth,
+      folder_id: $('setDriveFolder').value.trim(),
+      client_id: $('setDriveClientId') ? $('setDriveClientId').value.trim() : '',
+      client_secret: $('setDriveClientSecret') ? $('setDriveClientSecret').value : '',
+      refresh_token: $('setDriveRefreshToken') ? $('setDriveRefreshToken').value.trim() : '',
+      access_token: $('setDriveAccessToken') ? $('setDriveAccessToken').value.trim() : '',
+      service_account: $('setDriveSaveSa').checked ? serviceAccount : {}
+    },
+    auto_backup: {
+      enabled: $('setAutoEnabled').checked,
+      auto_enabled: $('setAutoEnabled').checked,
+      poll_seconds: parseInt($('setAutoPoll').value || '5', 10),
+      settle_seconds: parseInt($('setAutoSettle').value || '15', 10),
+      queue_for_browser_drive: $('setAutoQueueDrive').checked
+    }
+  };
+  try {
+    const r = await fetch('/api/settings/cloud', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg)
+    });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    log('Cloud settings saved', 'ok');
+    renderSettings();
+  } catch (e) {
+    log('Save settings failed: ' + e.message, 'err');
+  }
+}
+
+async function testCloudSettings() {
+  try {
+    const r = await fetch('/api/cloud/status');
+    const d = await r.json();
+    if (d.config_error) {
+      log('Cloud config: ' + d.config_error, 'err');
+      return;
+    }
+    log('Cloud config OK: ' + d.provider + (d.provider === 'google_drive' ? ' / ' + d.drive_mode : ''), 'ok');
+    if (d.provider === 'ftp') {
+      log('Testing FTP to ' + (d.host || '?') + ':' + (d.port || 21) + ' from PS5...');
+      const tr = await fetch('/api/cloud/test_ftp');
+      const td = await tr.json();
+      if (td.ok) log(td.message || 'FTP test OK', 'ok');
+      else log('FTP test failed (' + (td.stage || 'unknown') + '): ' + (td.error || 'unknown error'), 'err');
+    }
+  } catch (e) {
+    log('Cloud status failed: ' + e.message, 'err');
+  }
+}
+
+async function validateDriveToken(token) {
+  token = normalizeDriveToken(token);
+  if (!token) throw new Error('Add a Google Drive OAuth access token in Settings first');
+  const r = await fetch('https://oauth2.googleapis.com/tokeninfo?access_token=' + encodeURIComponent(token));
+  const txt = await r.text();
+  if (!r.ok) throw new Error('Google Drive token is invalid or expired. Paste a fresh OAuth access token with Drive scope.');
+  let info = {};
+  try { info = JSON.parse(txt || '{}'); } catch(e) {}
+  const scopes = (info.scope || '').split(/\s+/);
+  const okScope = scopes.includes('https://www.googleapis.com/auth/drive')
+    || scopes.includes('https://www.googleapis.com/auth/drive.file')
+    || scopes.includes('https://www.googleapis.com/auth/drive.appdata');
+  if (!okScope) throw new Error('Google Drive token is missing Drive scope. Use drive.file or drive scope.');
+  localStorage.setItem('gdrive_access_token', token);
+  return info;
+}
+
+async function testDriveToken() {
+  try {
+    const inputToken = $('setDriveAccessToken') ? $('setDriveAccessToken').value : '';
+    const token = normalizeDriveToken(inputToken || localStorage.getItem('gdrive_access_token') || '');
+    const info = await validateDriveToken(token);
+    log('Google Drive access token OK' + (info.expires_in ? ' (expires in ' + info.expires_in + 's)' : ''), 'ok');
+  } catch(e) {
+    log('Google Drive access token failed: ' + e.message, 'err');
+  }
+}
+
+function base64UrlString(s) {
+  return btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlBytes(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function pemToArrayBuffer(pem) {
+  const clean = (pem || '').replace(/-----BEGIN PRIVATE KEY-----/g, '')
+    .replace(/-----END PRIVATE KEY-----/g, '').replace(/\s+/g, '');
+  const bin = atob(clean);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function utf8Bytes(s) {
+  if (window.TextEncoder) return new TextEncoder().encode(s);
+  const enc = unescape(encodeURIComponent(s));
+  const out = new Uint8Array(enc.length);
+  for (let i = 0; i < enc.length; i++) out[i] = enc.charCodeAt(i);
+  return out;
+}
+
+function bytesToBigInt(bytes) {
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    const h = bytes[i].toString(16);
+    hex += h.length === 1 ? '0' + h : h;
+  }
+  return BigInt('0x' + (hex || '0'));
+}
+
+function bigIntToBytes(v, len) {
+  let hex = v.toString(16);
+  if (hex.length % 2) hex = '0' + hex;
+  const raw = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < raw.length; i++) raw[i] = parseInt(hex.substr(i * 2, 2), 16);
+  if (raw.length === len) return raw;
+  const out = new Uint8Array(len);
+  out.set(raw.slice(Math.max(0, raw.length - len)), Math.max(0, len - raw.length));
+  return out;
+}
+
+function modPow(base, exp, mod) {
+  let result = 1n;
+  base %= mod;
+  while (exp > 0n) {
+    if (exp & 1n) result = (result * base) % mod;
+    exp >>= 1n;
+    base = (base * base) % mod;
+  }
+  return result;
+}
+
+function derElement(bytes, off, expectedTag) {
+  const tag = bytes[off++];
+  if (expectedTag !== undefined && tag !== expectedTag) throw new Error('Unsupported private key format');
+  let len = bytes[off++];
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    len = 0;
+    for (let i = 0; i < n; i++) len = (len << 8) | bytes[off++];
+  }
+  return { tag, start: off, end: off + len, next: off + len };
+}
+
+function derInteger(bytes, off) {
+  const el = derElement(bytes, off, 0x02);
+  let b = bytes.slice(el.start, el.end);
+  while (b.length > 1 && b[0] === 0) b = b.slice(1);
+  return { value: bytesToBigInt(b), next: el.next, byteLength: b.length };
+}
+
+function parsePkcs8RsaPrivateKey(pem) {
+  if (typeof BigInt === 'undefined') throw new Error('This browser needs WebCrypto or BigInt to sign service-account JWTs');
+  const bytes = new Uint8Array(pemToArrayBuffer(pem));
+  const root = derElement(bytes, 0, 0x30);
+  let off = root.start;
+  off = derElement(bytes, off, 0x02).next;      // PrivateKeyInfo version
+  off = derElement(bytes, off, 0x30).next;      // AlgorithmIdentifier
+  const keyOctets = derElement(bytes, off, 0x04);
+  const rsa = bytes.slice(keyOctets.start, keyOctets.end);
+  const seq = derElement(rsa, 0, 0x30);
+  off = seq.start;
+  off = derElement(rsa, off, 0x02).next;        // RSAPrivateKey version
+  const n = derInteger(rsa, off); off = n.next;
+  off = derElement(rsa, off, 0x02).next;        // publicExponent
+  const d = derInteger(rsa, off);
+  return { n: n.value, d: d.value, k: n.byteLength };
+}
+
+function sha256Bytes(data) {
+  const k = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  const bitLen = data.length * 8;
+  const len = (((data.length + 9 + 63) >> 6) << 6);
+  const msg = new Uint8Array(len);
+  msg.set(data);
+  msg[data.length] = 0x80;
+  const dv = new DataView(msg.buffer);
+  dv.setUint32(len - 4, bitLen >>> 0);
+  dv.setUint32(len - 8, Math.floor(bitLen / 0x100000000));
+  let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
+  let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+  const w = new Uint32Array(64);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let i = 0; i < msg.length; i += 64) {
+    for (let t = 0; t < 16; t++) w[t] = dv.getUint32(i + t * 4);
+    for (let t = 16; t < 64; t++) {
+      const s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+      const s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+      w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+    for (let t = 0; t < 64; t++) {
+      const s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const temp1 = (h + s1 + ch + k[t] + w[t]) >>> 0;
+      const s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (s0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + temp1) >>> 0;
+      d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
+  }
+  const out = new Uint8Array(32);
+  const od = new DataView(out.buffer);
+  [h0,h1,h2,h3,h4,h5,h6,h7].forEach((v, i) => od.setUint32(i * 4, v));
+  return out;
+}
+
+function rsaSha256SignFallback(input, pem) {
+  const key = parsePkcs8RsaPrivateKey(pem);
+  const digest = sha256Bytes(utf8Bytes(input));
+  const prefix = [0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20];
+  const tLen = prefix.length + digest.length;
+  if (key.k < tLen + 11) throw new Error('RSA key is too small');
+  const em = new Uint8Array(key.k);
+  em[0] = 0; em[1] = 1;
+  em.fill(0xff, 2, key.k - tLen - 1);
+  em[key.k - tLen - 1] = 0;
+  em.set(prefix, key.k - tLen);
+  em.set(digest, key.k - digest.length);
+  return bigIntToBytes(modPow(bytesToBigInt(em), key.d, key.n), key.k);
+}
+
+async function signServiceJwt(input, pem) {
+  if (window.crypto && window.crypto.subtle) {
+    const key = await window.crypto.subtle.importKey('pkcs8', pemToArrayBuffer(pem),
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+    return new Uint8Array(await window.crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, utf8Bytes(input)));
+  }
+  return rsaSha256SignFallback(input, pem);
+}
+
+function loadServiceAccount(cfg) {
+  const local = localStorage.getItem('gdrive_service_account');
+  if (local) return JSON.parse(local);
+  const gd = (cfg && cfg.google_drive) || {};
+  const sa = gd.service_account || {};
+  if (sa.private_key && sa.private_key !== '********') return sa;
+  throw new Error('Paste a Google service account JSON in Settings first');
+}
+
+async function serviceAccountAccessToken(cfg) {
+  const sa = loadServiceAccount(cfg);
+  if (!sa.client_email || !sa.private_key) throw new Error('Service account JSON must include client_email and private_key');
+  const tokenUri = sa.token_uri || 'https://oauth2.googleapis.com/token';
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  if (sa.private_key_id) header.kid = sa.private_key_id;
+  const payload = {
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/drive',
+    aud: tokenUri,
+    iat: now,
+    exp: now + 3600
+  };
+  const input = base64UrlString(JSON.stringify(header)) + '.' + base64UrlString(JSON.stringify(payload));
+  const sig = await signServiceJwt(input, sa.private_key);
+  const assertion = input + '.' + base64UrlBytes(sig);
+  const r = await fetch(tokenUri, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + encodeURIComponent(assertion)
+  });
+  const txt = await r.text();
+  if (!r.ok) throw new Error('Service account token failed: HTTP ' + r.status + ' ' + txt);
+  const d = JSON.parse(txt || '{}');
+  if (!d.access_token) throw new Error('Service account token response did not include access_token');
+  return d.access_token;
+}
+
+async function tryValidateDriveToken(token) {
+  token = normalizeDriveToken(token);
+  if (!token || token === '********') return null;
+  try {
+    await validateDriveToken(token);
+    return token;
+  } catch (e) {
+    return null;
+  }
+}
+
+function driveAuthMode(cfg) {
+  const gd = (cfg && cfg.google_drive) || {};
+  let mode = gd.auth_mode || localStorage.getItem('gdrive_auth_mode') || 'oauth_refresh';
+  if (mode === 'oauth_token') mode = 'oauth_refresh';
+  return mode;
+}
+
+function driveOAuthCredentials(cfg) {
+  const gd = (cfg && cfg.google_drive) || {};
+  return {
+    clientId: ($('setDriveClientId') ? $('setDriveClientId').value.trim() : '') || gd.client_id || '',
+    clientSecret: ($('setDriveClientSecret') ? $('setDriveClientSecret').value : '') || gd.client_secret || '',
+    refreshToken: ($('setDriveRefreshToken') ? $('setDriveRefreshToken').value.trim() : '') || gd.refresh_token || '',
+    accessToken: normalizeDriveToken(
+      ($('setDriveAccessToken') ? $('setDriveAccessToken').value : '')
+      || gd.access_token
+      || localStorage.getItem('gdrive_access_token')
+      || ''
+    )
+  };
+}
+
+async function oauthRefreshAccessToken(cfg) {
+  const creds = driveOAuthCredentials(cfg);
+  if (!creds.clientId) throw new Error('OAuth Client ID is required');
+  if (!creds.clientSecret || creds.clientSecret === '********') throw new Error('OAuth Client Secret is required');
+  if (!creds.refreshToken || creds.refreshToken === '********') throw new Error('OAuth Refresh Token is required');
+
+  const cacheKey = 'gdrive_oauth_cache_' + creds.clientId.slice(-8);
+  const cached = sessionStorage.getItem(cacheKey);
+  if (cached) {
+    try {
+      const c = JSON.parse(cached);
+      if (c.token && c.expires_at > Date.now() + 60000) return c.token;
+    } catch (e) {}
+  }
+
+  const live = await tryValidateDriveToken(creds.accessToken);
+  if (live) return live;
+
+  const body = new URLSearchParams({
+    client_id: creds.clientId,
+    client_secret: creds.clientSecret,
+    refresh_token: creds.refreshToken,
+    grant_type: 'refresh_token'
+  });
+  const r = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString()
+  });
+  const txt = await r.text();
+  if (!r.ok) throw new Error('OAuth refresh failed: HTTP ' + r.status + ' ' + txt);
+  let d = {};
+  try { d = JSON.parse(txt || '{}'); } catch (e) {}
+  if (!d.access_token) throw new Error('OAuth refresh response did not include access_token');
+  sessionStorage.setItem(cacheKey, JSON.stringify({
+    token: d.access_token,
+    expires_at: Date.now() + ((d.expires_in || 3600) - 60) * 1000
+  }));
+  localStorage.setItem('gdrive_access_token', d.access_token);
+  return d.access_token;
+}
+
+async function driveAccessToken(cfg) {
+  const mode = driveAuthMode(cfg);
+  if (mode === 'oauth_refresh') return oauthRefreshAccessToken(cfg);
+  return serviceAccountAccessToken(cfg);
+}
+
+async function testDriveAccess() {
+  try {
+    const cfg = await loadCloudConfigForAction();
+    const token = await driveAccessToken(cfg);
+    const folderId = ($('setDriveFolder') ? $('setDriveFolder').value.trim() : ((cfg.google_drive || {}).folder_id || ''));
+    if (!folderId) throw new Error('Folder ID is required');
+    const r = await fetch('https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(folderId) + '?fields=id,name,mimeType,capabilities/canAddChildren&supportsAllDrives=true', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    const txt = await r.text();
+    if (!r.ok) {
+      if (r.status === 404) {
+        if (driveAuthMode(cfg) === 'oauth_refresh') {
+          throw new Error('Drive folder was not found for this OAuth account. Check the Folder ID and tokens. Google said: ' + txt);
+        } else {
+          const sa = loadServiceAccount(cfg);
+          throw new Error('Drive folder was not found or is not shared with service account '
+            + (sa.client_email || '(missing client_email)') + '. Check the Folder ID and share the folder with that email. Google said: ' + txt);
+        }
+      }
+      throw new Error('Drive folder check failed: HTTP ' + r.status + ' ' + txt);
+    }
+    const d = JSON.parse(txt || '{}');
+    if (d.mimeType !== 'application/vnd.google-apps.folder') throw new Error('Drive ID is not a folder: ' + (d.name || d.id));
+    if (d.capabilities && d.capabilities.canAddChildren === false) throw new Error('Drive auth can see the folder but cannot upload to it. Give this account Editor access.');
+    log('Drive auth can access folder: ' + (d.name || d.id), 'ok');
+  } catch(e) {
+    log('Drive access test failed: ' + e.message, 'err');
+  }
+}
+
+async function testServiceAccount() {
+  return testDriveAccess();
 }
 
 /* ── Render toolbar ────────────────────────────────── */
@@ -962,6 +1612,7 @@ function renderTB() {
     if (!isUsb) {
       h += '<button class="btn grn desk-btn" onclick="dlZip()" ' + (bsy ? 'disabled' : '') + '>Download Decrypted Zip</button>';
       h += '<button class="btn desk-btn" onclick="dlBin()" ' + (bsy ? 'disabled' : '') + '>Download Encrypted</button>';
+      h += '<button class="btn desk-btn" onclick="cloudBackupSave(si)" ' + (bsy ? 'disabled' : '') + '>Cloud Backup</button>';
       h += '<button class="btn desk-btn" onclick="dumpUsb()" ' + (bsy ? 'disabled' : '') + '>Dump to USB</button>';
       h += '<button class="btn red desk-btn" onclick="um()" ' + (bsy ? 'disabled' : '') + '>Unmount</button>';
     } else {
@@ -974,6 +1625,7 @@ function renderTB() {
         ? '<div onclick="closeOpts();importUsb()" style="color:#8b5cf6">Import to System</div>'
         : '<div onclick="closeOpts();dlZip()">Download Decrypted Zip</div>'
           + '<div onclick="closeOpts();dlBin()">Download Encrypted</div>'
+          + '<div onclick="closeOpts();cloudBackupSave(si)">Cloud Backup</div>'
           + '<div onclick="closeOpts();dumpUsb()">Dump to USB</div>'
           + '<div onclick="closeOpts();ctxUpload()">Upload File</div>'
           + '<div class="ctx-del" onclick="closeOpts();um()">Unmount</div>')
@@ -984,7 +1636,7 @@ function renderTB() {
 
 /* ── Select save ───────────────────────────────────── */
 async function sel(i) {
-  if (bsy || tab !== 'browse') return;
+  if (bsy || bulkRunning || tab !== 'browse') return;
   si = i;
   renderL();
   await mountBrw(i);
@@ -1640,6 +2292,7 @@ function showTitleMenu(e, titleId, isUsb) {
   } else {
     items += '<div onclick="showExportModal(\'' + tid + '\',false)">Export All Saves</div>';
     items += '<div onclick="showExportModal(\'' + tid + '\',true)">Export All Decrypted</div>';
+    items += '<div onclick="cloudBackupTitle(\'' + tid + '\')">Cloud Backup All</div>';
   }
   items += '<div class="ctx-del" onclick="deleteTitle(\'' + tid + '\')">Delete All Saves</div>';
   m.innerHTML = items;
@@ -1736,6 +2389,8 @@ function showSaveMenu(e, idx) {
   let items = '';
   if (s.usb) {
     items += '<div onclick="importSingleUsb(' + idx + ')">Import to System</div>';
+  } else {
+    items += '<div onclick="cloudBackupSave(' + idx + ')">Cloud Backup</div>';
   }
   items += '<div class="ctx-del" onclick="deleteSave(' + idx + ')">Delete</div>';
   m.innerHTML = items;
@@ -2431,6 +3086,256 @@ async function dlBin() {
   bsy = false;
 }
 
+async function pollCloudStatus() {
+  try {
+    const r = await fetch('/api/cloud/status');
+    const d = await r.json();
+    if (d.running) {
+      const msg = 'Cloud backup: ' + (d.active || 'uploading')
+        + (d.progress ? ' (' + d.progress + '%)' : '');
+      if (msg !== lastCloudProgress) {
+        lastCloudProgress = msg;
+        log(msg);
+      }
+      return;
+    }
+    lastCloudProgress = '';
+    if (!cloudAwaiting) return;
+    cloudAwaiting = false;
+    cloudBusy = false;
+    if (cloudPoll) { clearInterval(cloudPoll); cloudPoll = null; }
+    if (d.last_ok) log('Cloud backup uploaded to ' + d.last_remote, 'ok');
+    else log('Cloud backup failed: ' + (d.last_error || d.config_error || 'unknown error'), 'err');
+  } catch (e) {
+    cloudAwaiting = false;
+    cloudBusy = false;
+    lastCloudProgress = '';
+    if (cloudPoll) { clearInterval(cloudPoll); cloudPoll = null; }
+    log('Cloud status failed: ' + e.message, 'err');
+  }
+  bsy = false; renderTB(); renderCt();
+}
+
+function startCloudPoll() {
+  cloudAwaiting = true;
+  if (cloudPoll) clearInterval(cloudPoll);
+  cloudPoll = setInterval(pollCloudStatus, 2000);
+  pollCloudStatus();
+}
+
+function filenameFromDisposition(h, fallback) {
+  const m = h && h.match(/filename="([^"]+)"/);
+  return m ? m[1] : fallback;
+}
+
+function xhrPutWithProgress(url, token, blob, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    xhr.setRequestHeader('Authorization', 'Bearer ' + token);
+    xhr.setRequestHeader('Content-Type', 'application/zip');
+    xhr.setRequestHeader('Content-Range', 'bytes 0-' + (blob.size - 1) + '/' + blob.size);
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve(xhr);
+      else reject(new Error('Drive upload failed: HTTP ' + xhr.status + ' ' + xhr.responseText));
+    };
+    xhr.onerror = () => reject(new Error('Drive upload network error'));
+    xhr.send(blob);
+  });
+}
+
+async function uploadBlobToDrive(blob, filename, cfg) {
+  const gd = cfg.google_drive || {};
+  if (!gd.folder_id) throw new Error('Google Drive Folder ID is required');
+  const token = await driveAccessToken(cfg);
+  const metadata = { name: filename, mimeType: 'application/zip' };
+  metadata.parents = [gd.folder_id];
+  const init = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json; charset=UTF-8',
+      'X-Upload-Content-Type': 'application/zip',
+      'X-Upload-Content-Length': String(blob.size)
+    },
+    body: JSON.stringify(metadata)
+  });
+  if (!init.ok) {
+    const errText = await init.text();
+    if (init.status === 403 && errText.indexOf('Service Accounts do not have storage quota') >= 0) {
+      throw new Error('Service accounts cannot upload to normal My Drive folders because they have no storage quota. Use OAuth2 Refresh Token auth for personal My Drive, or a Shared Drive with a service account.');
+    }
+    throw new Error('Drive session failed: HTTP ' + init.status + ' ' + errText);
+  }
+  const session = init.headers.get('Location');
+  if (!session) throw new Error('Drive did not return an upload session');
+  const xhr = await xhrPutWithProgress(session, token, blob, (loaded, total) => {
+    const pct = Math.round(loaded * 100 / total);
+    log('Google Drive upload ' + pct + '% (' + fmtB(loaded) + '/' + fmtB(total) + ')');
+  });
+  let result = {};
+  try { result = JSON.parse(xhr.responseText || '{}'); } catch(e) {}
+  return result;
+}
+
+async function loadCloudConfigForAction() {
+  const r = await fetch('/api/settings/cloud');
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return d.config || { provider: 'ftp' };
+}
+
+async function googleDriveBackup(packageUrl, fallbackName, label) {
+  const cfg = await loadCloudConfigForAction();
+  const gd = cfg.google_drive || {};
+  if (cfg.provider !== 'google_drive' || (gd.mode || 'browser') !== 'browser') return false;
+  log('Packaging ' + label + ' for Google Drive...');
+  const pr = await fetch(packageUrl);
+  const ct = pr.headers.get('Content-Type') || '';
+  if (ct.indexOf('application/json') >= 0) {
+    const d = await pr.json();
+    throw new Error(d.error || 'Package failed');
+  }
+  if (!pr.ok) throw new Error('Package failed: HTTP ' + pr.status);
+  const blob = await pr.blob();
+  const filename = filenameFromDisposition(pr.headers.get('Content-Disposition'), fallbackName);
+  log('Uploading ' + filename + ' (' + fmtB(blob.size) + ') to Google Drive...');
+  const result = await uploadBlobToDrive(blob, filename, cfg);
+  log('Google Drive upload complete' + (result.id ? ': ' + result.id : ''), 'ok');
+  return true;
+}
+
+let queueDraining = false;
+
+async function refreshAutoStatus() {
+  if (!$('autoStatus')) return;
+  try {
+    const r = await fetch('/api/cloud/auto_status');
+    const d = await r.json();
+    let mode = d.lnc_saw_title ? 'game-close detection' : 'waiting for watched game';
+    if (!d.auto_enabled) mode = 'auto backup disabled in config';
+    else if (!d.cloud_enabled) mode = 'cloud backup disabled in config';
+    else if (d.config_error) mode = 'config error';
+    $('autoStatus').innerHTML = 'Watcher: ' + (d.watcher_running ? 'running' : 'stopped')
+      + ' | Mode: ' + esc(mode)
+      + ' | Running: ' + esc(d.current_title || 'none')
+      + ' | Last: ' + esc(d.last_result || 'none')
+      + ' | Pending Drive queue: ' + (d.pending_count || 0);
+  } catch (e) {
+    $('autoStatus').textContent = 'Auto status failed: ' + e.message;
+  }
+}
+
+async function loadDriveQueueStatus() {
+  try {
+    const r = await fetch('/api/cloud/queue');
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    const count = (d.queue || []).length;
+    if (count) log('Pending Google Drive backup queue: ' + count);
+    return d.queue || [];
+  } catch (e) {
+    if ($('autoStatus')) $('autoStatus').textContent = 'Queue status failed: ' + e.message;
+    return [];
+  }
+}
+
+async function drainDriveQueue(manual) {
+  if (queueDraining) return;
+  queueDraining = true;
+  try {
+    const cfg = await loadCloudConfigForAction();
+    const gd = cfg.google_drive || {};
+    if (cfg.provider !== 'google_drive' || (gd.mode || 'browser') !== 'browser') return;
+    const queue = await loadDriveQueueStatus();
+    if (!queue.length) {
+      if (manual) log('No pending Google Drive backups');
+      return;
+    }
+    await driveAccessToken(cfg);
+    for (const item of queue) {
+      const id = item.id;
+      const filename = (item.filename || id) + '.zip';
+      log('Uploading queued backup ' + filename + '...');
+      const pr = await fetch('/api/cloud/queue_download?id=' + encodeURIComponent(id));
+      if (!pr.ok) throw new Error('Queue download failed: HTTP ' + pr.status);
+      const blob = await pr.blob();
+      const result = await uploadBlobToDrive(blob, filename, cfg);
+      const done = await fetch('/api/cloud/queue_done?id=' + encodeURIComponent(id), { method: 'POST' });
+      const dd = await done.json();
+      if (dd.error) throw new Error(dd.error);
+      log('Queued Drive upload complete' + (result.id ? ': ' + result.id : ''), 'ok');
+    }
+    refreshAutoStatus();
+  } catch (e) {
+    if (manual) log('Pending Drive upload failed: ' + e.message, 'err');
+  } finally {
+    queueDraining = false;
+  }
+}
+
+async function cloudBackupSave(idx) {
+  closeCtxMenu();
+  if (cloudBusy || bsy || bulkRunning || idx < 0 || !S[idx] || S[idx].usb) return;
+  const s = S[idx];
+  try {
+    if (mt) {
+      bsy = true; renderTB();
+      log('Unmounting to finalize encrypted save...');
+      await fetch('/api/unmount');
+      mt = false; cf = [];
+      bsy = false; renderTB();
+    }
+    const handled = await googleDriveBackup('/api/cloud/package?idx=' + idx,
+      s.title_id + '_' + s.save_name + '_enc.zip',
+      s.title_id + '/' + s.save_name);
+    if (handled) return;
+    cloudBusy = true;
+    log('Starting cloud backup for ' + s.title_id + '/' + s.save_name + '...');
+    const r = await fetch('/api/cloud/upload?idx=' + idx + '&mode=enc');
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    log('Cloud backup running in background...');
+    startCloudPoll();
+  } catch (e) {
+    cloudBusy = false;
+    log('Cloud backup failed: ' + e.message, 'err');
+    bsy = false; renderTB(); renderCt();
+  }
+}
+
+async function cloudBackupTitle(titleId) {
+  closeCtxMenu();
+  if (cloudBusy || bsy) return;
+  try {
+    if (mt) {
+      bsy = true; renderTB();
+      log('Unmounting to finalize encrypted save...');
+      await fetch('/api/unmount');
+      mt = false; cf = [];
+      bsy = false; renderTB();
+    }
+    const handled = await googleDriveBackup('/api/cloud/package_title?id=' + encodeURIComponent(titleId),
+      titleId + '_all_enc.zip',
+      'all saves in ' + titleId);
+    if (handled) return;
+    cloudBusy = true;
+    log('Starting cloud backup for all saves in ' + titleId + '...');
+    const r = await fetch('/api/cloud/upload_title?id=' + encodeURIComponent(titleId) + '&mode=enc');
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    log('Cloud backup running in background...');
+    startCloudPoll();
+  } catch (e) {
+    cloudBusy = false;
+    log('Cloud backup failed: ' + e.message, 'err');
+    bsy = false; renderTB(); renderCt();
+  }
+}
+
 /* ── Dump to USB with progress ─────────────────────── */
 async function dumpUsb() {
   if (bsy || si < 0) return;
@@ -2512,6 +3417,110 @@ async function um() {
   bsy = false;
 }
 
+/* ── Bulk export queue (sequential, web UI only) ───── */
+async function unmountIfNeeded() {
+  if (!mt) return;
+  await fetch('/api/unmount');
+  mt = false; cf = [];
+}
+
+async function bulkExportTitle(titleId, decrypted) {
+  await unmountIfNeeded();
+  const apiUrl = decrypted ? '/api/export_title_dec' : '/api/export_title';
+  log((decrypted ? 'Exporting all decrypted saves for ' : 'Exporting all saves for ') + titleId + '...');
+  const r = await fetch(apiUrl + '?id=' + encodeURIComponent(titleId));
+  const ct = r.headers.get('Content-Type') || '';
+  if (ct.indexOf('application/json') >= 0) {
+    const d = await r.json();
+    throw new Error(d.error || 'Export failed');
+  }
+  if (!r.ok) throw new Error('Export failed: HTTP ' + r.status);
+  const b = await r.blob();
+  const fallback = titleId + (decrypted ? '_dec_all.zip' : '_all.zip');
+  const fn = filenameFromDisposition(r.headers.get('Content-Disposition'), fallback);
+  dl(b, fn);
+  log('Downloaded ' + titleId + ' (' + fmtB(b.size) + ')', 'ok');
+}
+
+function waitCloudUploadDone() {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const iv = setInterval(async () => {
+      try {
+        const r = await fetch('/api/cloud/status');
+        const d = await r.json();
+        if (d.running) {
+          if (Date.now() - started > 600000) {
+            clearInterval(iv);
+            reject(new Error('Cloud upload timed out after 10 minutes'));
+          }
+          return;
+        }
+        clearInterval(iv);
+        if (d.last_ok) resolve(d);
+        else reject(new Error(d.last_error || d.config_error || 'Cloud upload failed'));
+      } catch (e) {
+        clearInterval(iv);
+        reject(e);
+      }
+    }, 2000);
+  });
+}
+
+async function bulkCloudBackupTitle(titleId) {
+  await unmountIfNeeded();
+  const handled = await googleDriveBackup('/api/cloud/package_title?id=' + encodeURIComponent(titleId),
+    titleId + '_all_enc.zip',
+    'all saves in ' + titleId);
+  if (handled) return;
+  cloudBusy = true;
+  const r = await fetch('/api/cloud/upload_title?id=' + encodeURIComponent(titleId) + '&mode=enc');
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  log('Cloud backup uploading all saves in ' + titleId + '...');
+  await waitCloudUploadDone();
+  cloudBusy = false;
+  log('Cloud backup done: ' + titleId, 'ok');
+}
+
+async function bulkQueue(kind) {
+  if (bsy || bulkRunning) return;
+  const titles = visibleBulkTitles().filter(t => bulkSel.has(t));
+  if (!titles.length) {
+    log('No titles selected for bulk queue', 'err');
+    return;
+  }
+  const labels = { dec: 'export all decrypted', enc: 'export all saves', cloud: 'cloud backup all' };
+  bulkRunning = true;
+  bsy = true;
+  updateBulkBar();
+  renderTB();
+  log('Bulk queue: ' + titles.length + ' title(s) — ' + (labels[kind] || kind));
+  let ok = 0, fail = 0;
+  for (let n = 0; n < titles.length; n++) {
+    const titleId = titles[n];
+    log('[' + (n + 1) + '/' + titles.length + '] ' + titleId);
+    try {
+      if (kind === 'dec') await bulkExportTitle(titleId, true);
+      else if (kind === 'enc') await bulkExportTitle(titleId, false);
+      else if (kind === 'cloud') await bulkCloudBackupTitle(titleId);
+      ok++;
+    } catch (e) {
+      fail++;
+      log('Bulk item failed: ' + e.message, 'err');
+      cloudBusy = false;
+    }
+  }
+  bulkRunning = false;
+  bsy = false;
+  si = -1;
+  updateBulkBar();
+  renderL();
+  renderTB();
+  renderCt();
+  log('Bulk queue finished: ' + ok + ' ok' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'err' : 'ok');
+}
+
 /* ── Download helper ───────────────────────────────── */
 function dl(b, n) {
   const a = document.createElement('a');
@@ -2544,6 +3553,11 @@ if (window.innerWidth <= 768) $('drawer').classList.add('collapsed');
 else drawerOpen = true;
 updateDrawer();
 loadUsers().then(() => load());
+setInterval(() => {
+  if (tab !== 'settings') return;
+  refreshAutoStatus();
+  drainDriveQueue(false);
+}, 15000);
 renderCt();
 renderTB();
 </script>
