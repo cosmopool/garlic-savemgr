@@ -47,14 +47,29 @@ jobs:
           make -C ps5-payload-sdk DESTDIR="$PS5_PAYLOAD_SDK" clean install
           echo "PS5_PAYLOAD_SDK=$PS5_PAYLOAD_SDK" >> "$GITHUB_ENV"
 
+      # Tag builds take their version from the tag (v1.2.3 -> 1.2.3) so the
+      # web UI matches the release; other builds keep the Makefile default.
       - name: Build
-        run: make PS5_PAYLOAD_SDK="$PS5_PAYLOAD_SDK"
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+              make PS5_PAYLOAD_SDK="$PS5_PAYLOAD_SDK" VERSION="${GITHUB_REF_NAME#v}"
+          else
+              make PS5_PAYLOAD_SDK="$PS5_PAYLOAD_SDK"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: garlic-savemgr
           path: garlic-savemgr.elf
+
+      - name: Publish GitHub release
+        if: ${{ startsWith(github.ref, 'refs/tags/') && github.server_url == 'https://github.com' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: garlic-savemgr.elf
+          prerelease: ${{ contains(github.ref_name, 'beta') }}
+          generate_release_notes: true
 
       - name: Create release (on tag push only)
         # Uses the Gitea/Forgejo /api/v1 release API, absent on github.com.
